@@ -129,7 +129,7 @@ Modificar: `copy` · `move` · `rotate` · `scale` · `mirror` · `offset` · `a
 ⚠️ `execute_lisp` está documentado pero NO debe usarse (ver regla 1).
 
 ### `plant3d` — Consulta de proyectos Plant 3D (solo lectura)
-`detect_project` · `line_summary` · `list_projects` · `find_untagged` · `validate_specs`
+`detect_project` · `line_summary` · `list_projects` · `find_untagged` · `validate_specs` · `list_lines`
 Lee directamente las bases SQLite (`.dcf`) del proyecto — **no requiere el plugin .NET**
 y nunca modifica el proyecto (apertura `mode=ro`).
 - `find_untagged` — lista los componentes de tubería SIN número de línea válido
@@ -143,6 +143,16 @@ y nunca modifica el proyecto (apertura `mode=ro`).
   material/schedule fuera de catálogo. Degrada con gracia si no existe la carpeta `Spec Sheets`
   o un `.pspc` es ilegible. Parámetros: `data["ignore_specs"]` (lista de specs auxiliares a
   excluir) y `data["limit"]` (acota la salida). Identifica componentes por `PnPID` + propiedades.
+- `list_lines` — genera la LINE LIST del proyecto: una fila por número de línea válido
+  (`LineNumberTag` no NULL/vacío/`?`). Estrategia híbrida: propiedades de línea (Service,
+  NominalSpec, NominalSize, aislamiento) desde la tabla cabecera `P3dLineGroup` (casada por Tag
+  normalizado TRIM+UPPER); specs reales y diámetros agregados desde `EngineeringItems`; DWG del
+  modelo 3D donde vive la línea desde `P3dDrawingLineGroupRelationship` → `PnPDrawings`. Los
+  tamaños se mantienen separados por unidad (in/mm) sin colapsar a rango. Robusto frente a
+  variaciones de esquema (usa `PRAGMA table_info`; degrada con gracia si faltan columnas
+  opcionales o tablas de relación). Parámetros: `data["ignore_specs"]` y `data["limit"]` (default
+  50, 0 = sin tope). **No disponible vía SQLite:** P&ID de origen y localización física del objeto
+  en el dibujo (requieren plugin .NET).
 **Por defecto consulta el proyecto que el usuario tiene abierto en AutoCAD:** si no se pasa
 `project`, lee `DWGPREFIX` del dibujo activo (vía backend File IPC) y sube hasta el `Project.xml`.
 También admite `project` explícito (ruta a la carpeta o, con `AUTOCAD_MCP_PLANT3D_ROOT`, el nombre).
@@ -193,12 +203,18 @@ del plugin .NET ni de AutoCAD abierto: se lee el SQLite con el módulo `sqlite3`
 
 - Tablas clave en `Piping.dcf`: `PipeRunComponent` (LineNumberTag, Service, Required Spec,
   SpoolNumber...), `EngineeringItems` (Spec, NominalDiameter, Material, Schedule...), unidas por `PnPID`.
+  **Hallazgo adicional:** `P3dLineGroup` — tabla cabecera con una fila por número de línea; recoge
+  Service, NominalSpec, NominalSize, aislamiento y otros atributos de la línea. Su esquema VARÍA
+  por proyecto (se usa `PRAGMA table_info` para seleccionar solo columnas presentes).
 - Proyectos de prueba en `\\172.16.0.220\Comun\06-INFORMÁTICA\3_UTILIDADES\MCP-Plant3D\Proyectos`.
 - Implementado: `plant3d.detect_project` · `plant3d.line_summary` · `plant3d.list_projects` ·
   `plant3d.find_untagged` (componentes sin `LineNumberTag` válido; implementada y testeada 2026-06-20) ·
   `plant3d.validate_specs` (validación de coherencia de especificaciones; implementada, testeada y
   commiteada 2026-06-22, commit `f4ecdab`). **Hallazgo:** los catálogos de specs viven en
-  `Spec Sheets\*.pspc`, que también son SQLite — accesibles sin plugin .NET.
+  `Spec Sheets\*.pspc`, que también son SQLite — accesibles sin plugin .NET. ·
+  `plant3d.list_lines` (LINE LIST completa; estrategia híbrida con `P3dLineGroup` + `EngineeringItems`
+  + relación de DWG; implementada, testeada — ~98 tests nuevos, suite total 306 verdes — commiteada
+  2026-06-22, commit `6c40dee`; validado: AIR LIQUIDE HUELVA = 114 líneas).
   Detección del proyecto abierto: lee `DWGPREFIX` del dibujo activo y sube hasta `Project.xml`.
 - Las dos herramientas de solo lectura del trío original ya están implementadas vía SQLite.
   **Fase actual: SOLO CONSULTA (decisión 2026-06-22).** La escritura y el plugin .NET quedan aplazados; ver sección siguiente.

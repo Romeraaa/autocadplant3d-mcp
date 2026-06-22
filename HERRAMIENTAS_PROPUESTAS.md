@@ -96,10 +96,37 @@ Ortográfico), con ruta y estado.
 
 ### B · Componentes y líneas
 
-#### B1. `plant3d-list-lines`
-Lista todos los **números de línea** del proyecto con sus propiedades: servicio/fluido,
-especificación, diámetro, aislamiento y P&ID de origen.
-**Valor:** la *line list* es uno de los entregables más solicitados.
+#### B1. `plant3d-list-lines` — ✅ IMPLEMENTADA (2026-06-22)
+
+Genera la **LINE LIST** del proyecto: una fila por número de línea válido (`LineNumberTag` no
+NULL/vacío/`?`). Expuesta como la operación `list_lines` del tool `plant3d`.
+
+**Estrategia híbrida** sobre `Piping.dcf` (SQLite, `mode=ro`):
+- **Propiedades de línea** (Service, NominalSpec, NominalSize, aislamiento) desde la tabla
+  cabecera `P3dLineGroup` (1 fila por línea). El match de Tag se hace por clave normalizada
+  (TRIM+UPPER) para tolerar espacios y variaciones de caja. **No se usa** `PipeRunComponent.Service`
+  porque se contamina con ramales (p.ej. `"AC,P"`).
+- **Specs reales y diámetros** agregados desde `EngineeringItems` — los tamaños se mantienen
+  **separados por unidad** (in/mm), sin colapsar a rango global.
+- **`model_dwgs`** — DWG del modelo 3D donde vive la línea, vía
+  `P3dDrawingLineGroupRelationship` → `PnPDrawings`. No es el P&ID.
+- **Robustez de esquema:** el esquema de `P3dLineGroup` varía por proyecto; se usa
+  `PRAGMA table_info` para seleccionar solo las columnas presentes. Degrada con gracia
+  (null/[] + notas) si faltan columnas opcionales o las tablas de relación de DWG.
+
+**Parámetros:** `data["ignore_specs"]` (lista de specs auxiliares a excluir, mapea a
+`_DEFAULT_IGNORE_SPECS`) · `data["limit"]` (acota salida, default 50, 0 = sin tope).
+
+**Salida:** `project`, `path`, `count`, `lines` (acotada por `limit`, con `omitted`), `notes`.
+
+**Limitaciones (no disponibles vía SQLite — aplazadas, requerirían plugin .NET):**
+- P&ID de origen de la línea.
+- Localización física del objeto en el dibujo (sin handle/GUID en SQLite).
+
+**Validado:** proyecto `23099 - AIR LIQUIDE HUELVA` = 114 líneas. ~98 tests nuevos; suite
+total: 306 tests, todos verdes. Commit `6c40dee` (2026-06-22).
+
+**Valor:** la *line list* es uno de los entregables más solicitados en ingeniería de proceso.
 
 #### B2. `plant3d-list-components`
 Lista componentes de tubería con filtros por clase (pipe, valve, fitting, flange, instrument),
@@ -206,7 +233,7 @@ origen.
 |-----------|-------------|--------|
 | ⭐⭐⭐ | A1. `project-info` | Punto de entrada; valida acceso al proyecto y la BD |
 | ⭐⭐⭐ | B2. `list-components` | Lector base que reutilizan casi todas las demás |
-| ⭐⭐⭐ | B1. `list-lines` | Line list — entregable de máximo valor |
+| ✅ | B1. `list-lines` | IMPLEMENTADA (2026-06-22), estrategia híbrida P3dLineGroup + EngineeringItems |
 | ✅ | E1. `find-untagged` | IMPLEMENTADA (2026-06-20), solo lectura vía SQLite |
 | ✅ | E2. `validate-specs` | IMPLEMENTADA (2026-06-22), solo lectura vía SQLite + .pspc |
 | ⭐⭐ | B5. `list-valves` / B6. `list-instruments` | Entregables habituales |
@@ -224,7 +251,8 @@ origen.
 2. **Inspeccionar** el esquema SQLite de un modelo real (`sqlite3` + `.dcf` / `.pspc`) para
    confirmar nombres de tabla, columnas y propiedades exactas — no requiere el plugin ni AutoCAD.
 3. **Implementar** las herramientas ⭐⭐⭐ del catálogo como operaciones del tool `plant3d`,
-   siguiendo el patrón de `find_untagged` y `validate_specs` (Python → `plant3d_query.py` → JSON).
+   siguiendo el patrón de `find_untagged`, `validate_specs` y `list_lines` (Python →
+   `plant3d_query.py` → JSON).
 4. **Iterar**: validar con el cliente y ampliar el catálogo según el listado de consultas recibido.
 
 *Si en el futuro se abre la fase de escritura, se retoma el scaffolding de `PlantMcpDispatch.dll`
