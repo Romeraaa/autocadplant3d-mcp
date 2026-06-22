@@ -53,7 +53,8 @@ Thumbs.db
 
 # Claude Code
 .claude/
-.mcp.json          # Contiene rutas absolutas locales; usa .mcp.json.example como plantilla
+# Contiene rutas absolutas locales; usa .mcp.json.example como plantilla
+.mcp.json
 
 # User-specific configuration
 claude_desktop_config.json
