@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "autocad-mcp": {
+      "command": ".venv/Scripts/python.exe",
+      "args": ["-m", "autocad_mcp"],
+      "env": {
+        "AUTOCAD_MCP_BACKEND": "auto",
+        "AUTOCAD_MCP_IPC_DIR": "C:/temp",
+        "AUTOCAD_MCP_IPC_TIMEOUT": "15"
+      }
+    }
+  }
+}
