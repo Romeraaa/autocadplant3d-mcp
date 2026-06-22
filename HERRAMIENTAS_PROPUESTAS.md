@@ -5,8 +5,13 @@
 > **Cambio de enfoque (2026-06-18).** Tras la reunión con el responsable de ingeniería, el
 > proyecto se centra específicamente en **AutoCAD Plant 3D**. La primera fase construirá
 > únicamente herramientas de **consulta** de datos: leer e interrogar la información de un
-> modelo Plant 3D sin modificarlo. La creación, validación-con-corrección y automatización de
-> escritura quedan para fases posteriores.
+> modelo Plant 3D sin modificarlo.
+>
+> **Decisión 2026-06-22 — fase actual: EXCLUSIVAMENTE consulta (solo lectura).** La escritura,
+> la validación-con-corrección y cualquier automatización que modifique el modelo quedan aplazadas.
+> El plugin .NET (`PlantMcpDispatch.dll`) **no se desarrolla por ahora**: las herramientas de
+> consulta se implementan directamente sobre los SQLite del proyecto (`.dcf`, `.pspc`) mediante
+> Python, sin necesidad del plugin.
 >
 > **Pendiente de la organización:**
 > - Listado de referencias / consultas concretas que se quieren hacer al MCP.
@@ -52,11 +57,21 @@ A diferencia de un DWG de AutoCAD "plano", un proyecto Plant 3D combina **geomet
 - **P&ID** — los diagramas llevan sus propios tags de activo y de línea, que *deberían* coincidir
   con el modelo 3D.
 
-**Mecanismo de acceso:** todas estas herramientas se apoyan en el plugin .NET
-`PlantMcpDispatch.dll` (ver `04 - Plugin Plant 3D`), que usa las APIs
-`Autodesk.ProcessPower.*` — principalmente el `DataLinksManager` para leer filas y propiedades,
-y `PnPProjectManager` para la estructura del proyecto. AutoLISP **no** puede acceder a estos
-datos, por eso es imprescindible el plugin.
+**Mecanismo de acceso (hallazgo clave de esta fase):** los ficheros de base de datos del
+proyecto Plant 3D (`.dcf`: `Piping.dcf`, `ProcessPower.dcf`…) y los catálogos de specs
+(`Spec Sheets\*.pspc`) son **bases SQLite estándar**. Las herramientas de **consulta** las leen
+directamente con el módulo `sqlite3` de Python en modo solo lectura (`mode=ro`), **sin necesidad
+del plugin .NET** ni de AutoCAD abierto.
+
+El plugin .NET (`PlantMcpDispatch.dll`) quedaría reservado para dos casos específicos, ambos
+**aplazados** en la fase actual:
+- (a) **Escritura** en la sesión viva de AutoCAD (p.ej. asignar capas o propiedades en el dibujo).
+- (b) **Datos no presentes en el SQLite** — como handles o GUIDs para localizar objetos
+  físicamente en el dibujo, accesibles únicamente vía `DataLinksManager`.
+
+AutoLISP sigue sin poder acceder a las APIs de Plant 3D (`Autodesk.ProcessPower.*`); esa
+limitación no afecta a la fase actual porque toda la consulta va directamente contra el SQLite.
+Si alguna herramienta del catálogo necesitara handles o escritura, se anotará explícitamente.
 
 ---
 
@@ -203,13 +218,17 @@ origen.
 
 ## Plan de ejecución de la Fase 1
 
+> **Fase actual: SOLO CONSULTA vía SQLite** — el plugin .NET queda aplazado (ver nota de cabecera).
+
 1. **Recibir** el listado de consultas de la organización y los modelos Plant 3D de prueba.
-2. **Inspeccionar** un modelo real para confirmar nombres de clase y propiedades exactas vía
-   `DataLinksManager` (el mapeo real solo se puede cerrar con un DWG de proyecto).
-3. **Scaffolding** del plugin `PlantMcpDispatch.dll` con un primer lector genérico
-   (`list-components`) como prueba de concepto end-to-end (Python → IPC → plugin → JSON).
-4. **Iterar** el catálogo: implementar las herramientas ⭐⭐⭐ primero, validar con el cliente,
-   y ampliar.
+2. **Inspeccionar** el esquema SQLite de un modelo real (`sqlite3` + `.dcf` / `.pspc`) para
+   confirmar nombres de tabla, columnas y propiedades exactas — no requiere el plugin ni AutoCAD.
+3. **Implementar** las herramientas ⭐⭐⭐ del catálogo como operaciones del tool `plant3d`,
+   siguiendo el patrón de `find_untagged` y `validate_specs` (Python → `plant3d_query.py` → JSON).
+4. **Iterar**: validar con el cliente y ampliar el catálogo según el listado de consultas recibido.
+
+*Si en el futuro se abre la fase de escritura, se retoma el scaffolding de `PlantMcpDispatch.dll`
+con el modelo de datos ya conocido por las consultas.*
 
 ---
 

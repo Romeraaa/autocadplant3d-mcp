@@ -201,22 +201,28 @@ del plugin .NET ni de AutoCAD abierto: se lee el SQLite con el módulo `sqlite3`
   `Spec Sheets\*.pspc`, que también son SQLite — accesibles sin plugin .NET.
   Detección del proyecto abierto: lee `DWGPREFIX` del dibujo activo y sube hasta `Project.xml`.
 - Las dos herramientas de solo lectura del trío original ya están implementadas vía SQLite.
-  Siguiente: `plant3d-assign-layers-by-property` (escritura — requiere plugin .NET).
+  **Fase actual: SOLO CONSULTA (decisión 2026-06-22).** La escritura y el plugin .NET quedan aplazados; ver sección siguiente.
 
-### Plugin .NET para Plant 3D (solo necesario para ESCRITURA)
+### Plugin .NET para Plant 3D — APLAZADO (fuera del alcance actual)
+
+> **Decisión 2026-06-22:** el proyecto se centra ÚNICAMENTE en herramientas de consulta (solo
+> lectura). El plugin .NET **no se desarrolla por ahora**; se retomará si/cuando se aborde
+> escritura en la sesión viva de AutoCAD.
+
 Plugin C# (`plant3d-plugin/PlantMcpDispatch.dll`) con APIs de Plant 3D (`Autodesk.ProcessPower.*`).
-Solo necesario para operaciones que **escriban** en la sesión viva (p.ej. asignar capas de verdad),
-no para consultas. AutoLISP no puede acceder a estas APIs.
+Solo necesario para operaciones que **escriban** en la sesión viva (p.ej. asignar capas de verdad)
+o que necesiten datos no disponibles en el SQLite (handles para localizar objetos en el dibujo,
+datos accesibles únicamente vía `DataLinksManager`). AutoLISP no puede acceder a estas APIs.
 
-**Estado:** Arquitectura decidida, entorno verificado (net8.0-windows, VS Code + .NET SDK 9).
-**Bloqueado por:** DWG de prueba de Plant 3D (pendiente de recibir de la organización).
+**Estado conservado para cuando se retome:**
+- Arquitectura decidida, entorno verificado (net8.0-windows, VS Code + .NET SDK 9).
+- Bloqueado por: DWG de prueba de Plant 3D (pendiente de recibir de la organización).
+- DLLs disponibles en `C:\Program Files\Autodesk\AutoCAD 2026\PLNT3D\`.
 
 Las 3 herramientas originalmente previstas:
-- `plant3d-find-untagged` — componentes sin `LineNumberTag` (lectura → ✅ IMPLEMENTADA vía SQLite, 2026-06-20, como `plant3d.find_untagged`)
-- `plant3d-validate-specs` — detecta incompatibilidades de especificación (lectura → ✅ IMPLEMENTADA vía SQLite, 2026-06-22, como `plant3d.validate_specs`; catálogo `Spec Sheets\*.pspc` también SQLite)
-- `plant3d-assign-layers-by-property` — asigna capas según propiedades (escritura → requiere plugin .NET; pendiente)
-
-DLLs disponibles en `C:\Program Files\Autodesk\AutoCAD 2026\PLNT3D\`.
+- `plant3d-find-untagged` — ✅ IMPLEMENTADA vía SQLite (2026-06-20, `plant3d.find_untagged`)
+- `plant3d-validate-specs` — ✅ IMPLEMENTADA vía SQLite (2026-06-22, `plant3d.validate_specs`; catálogos `Spec Sheets\*.pspc` también SQLite)
+- `plant3d-assign-layers-by-property` — escritura → requiere plugin .NET → **APLAZADA / fuera del alcance actual**
 
 ### Herramientas estructurales (HERRAMIENTAS_PROPUESTAS.md)
 10 herramientas propuestas para flujos de ingeniería estructural. Prioridad actual:
