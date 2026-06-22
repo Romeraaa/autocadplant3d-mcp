@@ -1,15 +1,19 @@
 # AutoCAD MCP Server
 
-MCP server for AutoCAD LT automation and headless DXF generation.
+MCP server for AutoCAD 2026 / AutoCAD LT automation, headless DXF generation, and read-only
+querying of AutoCAD Plant 3D projects. Developed for IDEA IT (Ingeniería y Diseño Estructural
+Avanzado, S.L.).
 
 Two backends, one API:
 
 | Backend | Runtime | Requires AutoCAD? | Screenshot |
 |---------|---------|-------------------|------------|
-| **File IPC** | Windows Python | Yes — AutoCAD LT 2024+ (Windows) | Win32 PrintWindow |
+| **File IPC** | Windows Python | Yes — AutoCAD LT 2024+ / AutoCAD 2026 (Windows) | Win32 PrintWindow |
 | **ezdxf** | Any platform | No (headless) | matplotlib render |
 
-The server exposes **8 consolidated tools** (`drawing`, `entity`, `layer`, `block`, `annotation`, `pid`, `view`, `system`) over the MCP stdio transport. An MCP client (Claude Desktop, Claude Code, etc.) connects and drives AutoCAD through natural-language requests.
+The server exposes **9 consolidated tools** (`drawing`, `entity`, `layer`, `block`, `annotation`, `pid`, `view`, `system`, `plant3d`) over the MCP stdio transport. An MCP client (Claude Desktop, Claude Code, etc.) connects and drives AutoCAD through natural-language requests.
+
+The `plant3d` tool queries Plant 3D project databases (`.dcf` SQLite files) directly in read-only mode — no .NET plugin or open AutoCAD session required for most operations.
 
 ## Prerequisites (File IPC backend)
 
@@ -25,8 +29,8 @@ The server exposes **8 consolidated tools** (`drawing`, `entity`, `layer`, `bloc
 ### 1. Clone and install
 
 ```powershell
-git clone https://github.com/puran-water/autocad-mcp.git
-cd autocad-mcp
+git clone https://github.com/Romeraaa/autocadplant3d-mcp.git
+cd autocadplant3d-mcp
 uv sync
 ```
 
@@ -49,7 +53,7 @@ Add to your MCP client configuration (e.g. Claude Desktop `claude_desktop_config
 {
   "mcpServers": {
     "autocad-mcp": {
-      "command": "C:\\path\\to\\autocad-mcp\\.venv\\Scripts\\python.exe",
+      "command": "C:\\path\\to\\autocadplant3d-mcp\\.venv\\Scripts\\python.exe",
       "args": ["-m", "autocad_mcp"],
       "env": { "AUTOCAD_MCP_BACKEND": "auto" }
     }
@@ -72,7 +76,7 @@ If your MCP client runs in WSL (e.g. Claude Code), launch the server through `cm
     "autocad-mcp": {
       "type": "stdio",
       "command": "cmd.exe",
-      "args": ["/d", "/s", "/c", "cd /d C:\\path\\to\\autocad-mcp && .venv\\Scripts\\python.exe -m autocad_mcp"],
+      "args": ["/d", "/s", "/c", "cd /d C:\\path\\to\\autocadplant3d-mcp && .venv\\Scripts\\python.exe -m autocad_mcp"],
       "env": { "AUTOCAD_MCP_BACKEND": "auto" }
     }
   }
@@ -155,7 +159,22 @@ Screenshots use `PrintWindow` (Win32) for the File IPC backend — works even wh
 
 `status`, `health`, `get_backend`, `runtime`, `init`, `execute_lisp`
 
-> `execute_lisp` runs arbitrary AutoLISP code (File IPC only). Pass `data: {code: "(+ 1 2)"}`. This turns the server into an extensible automation platform — any valid AutoLISP expression can be executed.
+> **Warning:** `execute_lisp` runs arbitrary AutoLISP code (File IPC only). Pass `data: {code: "(+ 1 2)"}`. However, on AutoCAD 2026 it triggers the APPLOAD dialog and blocks the thread — **do not use it**; use the native MCP operations instead.
+
+### `plant3d` — Plant 3D project queries (read-only)
+
+| Operation | Description |
+|-----------|-------------|
+| `detect_project` | Resolve the Plant 3D project currently open in AutoCAD (via `DWGPREFIX`) or by explicit path/name. |
+| `list_projects` | List Plant 3D projects found under `AUTOCAD_MCP_PLANT3D_ROOT`. |
+| `line_summary` | Per-line component summary for a given project: counts, specs, and diameters per `LineNumberTag`. |
+| `find_untagged` | Piping components without a valid `LineNumberTag` (NULL / empty / `?`), broken down by class (`PartCategory`) and spec. |
+| `validate_specs` | Spec-consistency checks: Spec vs. Required Spec, mixed specs per line, empty/ghost specs, material/schedule outside the spec catalogue. |
+| `list_lines` | The project line list — one row per line number with service, spec, size, insulation, and model DWGs. |
+
+> These operations read the Plant 3D project databases (`.dcf` SQLite files) and spec catalogues (`Spec Sheets\*.pspc`, also SQLite) directly, in **read-only mode** (`mode=ro`). They **do not require the .NET plugin or an open AutoCAD session** — except `detect_project`, which reads `DWGPREFIX` from the active drawing when no project path is supplied. The `plant3d` tool **never modifies the project**.
+>
+> Set the optional env var `AUTOCAD_MCP_PLANT3D_ROOT` to a folder containing Plant 3D project subfolders; this lets `list_projects` and `detect_project` resolve projects by name instead of full path.
 
 ## Architecture
 
@@ -181,6 +200,7 @@ The File IPC backend sends keystrokes to AutoCAD's MDIClient window via `PostMes
 | `AUTOCAD_MCP_IPC_DIR` | `C:/temp` | Directory for IPC command/result JSON files (must match on both Python and LISP sides) |
 | `AUTOCAD_MCP_IPC_TIMEOUT` | `10.0` | IPC command timeout in seconds (1-300) |
 | `AUTOCAD_MCP_ONLY_TEXT` | `false` | Disable screenshot capture (text feedback only) |
+| `AUTOCAD_MCP_PLANT3D_ROOT` | | Optional root folder containing Plant 3D project subfolders; lets the `plant3d` tool resolve projects by name instead of full path. |
 
 > **Note:** If you change `AUTOCAD_MCP_IPC_DIR`, you must also update the `*mcp-ipc-dir*` variable in `mcp_dispatch.lsp` to match.
 
@@ -204,6 +224,18 @@ AutoLISP was added to AutoCAD LT in the **2024 release (Windows only)**. AutoCAD
 | Selection sets | AutoLISP on Mac |
 
 The `mcp_dispatch.lsp` dispatcher is fully compatible with LT 2024+.
+
+## What's New — Plant 3D query tools
+
+The `plant3d` tool adds read-only querying of AutoCAD Plant 3D projects directly from the
+project's SQLite databases, with no .NET plugin and no AutoCAD session required:
+
+- **`find_untagged`** — identify piping components without a valid `LineNumberTag`, broken down by class and spec.
+- **`validate_specs`** — four spec-consistency checks (Spec vs. Required Spec, mixed specs per line, ghost specs, material/schedule outside catalogue).
+- **`list_lines`** — generate the project line list (service, spec, size, insulation, model DWGs) using a hybrid query over `P3dLineGroup` + `EngineeringItems`.
+- **`line_summary`**, **`detect_project`**, **`list_projects`** — project navigation and per-line breakdowns.
+
+All operations open `.dcf` and `.pspc` files with `mode=ro` and never write back to the project.
 
 ## What's New in v3.1
 
