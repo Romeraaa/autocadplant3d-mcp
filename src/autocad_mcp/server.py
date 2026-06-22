@@ -550,6 +550,10 @@ async def plant3d(
       find_untagged  — Componentes de tubería sin LineNumberTag (NULL, vacío
                        o '?'), con desglose por clase y por spec.
                        data: {project?}
+      validate_specs — Valida specs de tubería: spec real != Required Spec,
+                       líneas con specs mezcladas, specs vacías, specs sin
+                       fichero .pspc, y Schedule/Material fuera del catálogo.
+                       data: {project?, ignore_specs?, limit?}
       list_projects  — Lista proyectos bajo una raíz. data: {root?}
                        (usa AUTOCAD_MCP_PLANT3D_ROOT si no se indica root)
     """
@@ -567,6 +571,9 @@ async def plant3d(
     elif operation == "find_untagged":
         project = data.get("project") or await _detect_open_project()
         result = plant3d_query.find_untagged(project)
+    elif operation == "validate_specs":
+        project = data.get("project") or await _detect_open_project()
+        result = plant3d_query.validate_specs(project, data)
     else:
         return _json({"error": f"Unknown plant3d operation: {operation}"})
 
