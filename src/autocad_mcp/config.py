@@ -23,6 +23,11 @@ IPC_TIMEOUT = max(1.0, min(300.0, float(os.environ.get("AUTOCAD_MCP_IPC_TIMEOUT"
 # Screenshot
 ONLY_TEXT_FEEDBACK = os.environ.get("AUTOCAD_MCP_ONLY_TEXT", "").lower() in ("1", "true", "yes")
 
+# Plant 3D project query (read-only SQLite over the project .dcf databases).
+# Optional root folder containing Plant 3D project subfolders; lets the
+# `plant3d` tool resolve projects by name instead of full path.
+PLANT3D_ROOT = os.environ.get("AUTOCAD_MCP_PLANT3D_ROOT", "").strip()
+
 # Win32 availability
 WIN32_AVAILABLE = sys.platform == "win32"
 

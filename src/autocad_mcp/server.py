@@ -520,6 +520,88 @@ async def system(
 
 
 # ==========================================================================
+# 9. plant3d — Read-only queries over Plant 3D project databases
+# ==========================================================================
+
+
+@mcp.tool(annotations={"title": "Plant 3D Project Query (read-only)", "readOnlyHint": True})
+@_safe("plant3d")
+async def plant3d(
+    operation: str,
+    data: dict | None = None,
+) -> ToolResult:
+    """Consultas de solo lectura sobre los datos de un proyecto AutoCAD Plant 3D.
+
+    Lee directamente las bases SQLite (.dcf) del proyecto — no requiere el
+    plugin .NET. Nunca modifica el proyecto.
+
+    Por defecto consulta el **proyecto que el usuario tiene abierto en AutoCAD**:
+    si no se indica `project`, detecta el dibujo activo (DWGPREFIX) y sube hasta
+    su `Project.xml`. Esto requiere AutoCAD abierto con un dibujo del proyecto.
+    Alternativamente, se puede indicar `project` (ruta a la carpeta o, si
+    AUTOCAD_MCP_PLANT3D_ROOT está configurado, el nombre).
+
+    Operations:
+      detect_project — Identifica el proyecto Plant 3D actualmente abierto.
+                       data: {project?}
+      line_summary   — Resumen de líneas de tubería: por cada LineNumberTag,
+                       nº de componentes, spools, servicios, specs y diámetros.
+                       data: {project?}
+      find_untagged  — Componentes de tubería sin LineNumberTag (NULL, vacío
+                       o '?'), con desglose por clase y por spec.
+                       data: {project?}
+      list_projects  — Lista proyectos bajo una raíz. data: {root?}
+                       (usa AUTOCAD_MCP_PLANT3D_ROOT si no se indica root)
+    """
+    data = data or {}
+    from autocad_mcp import plant3d_query
+
+    if operation == "list_projects":
+        result = plant3d_query.list_projects(data.get("root"))
+    elif operation == "detect_project":
+        project = data.get("project") or await _detect_open_project()
+        result = plant3d_query.project_info(project)
+    elif operation == "line_summary":
+        project = data.get("project") or await _detect_open_project()
+        result = plant3d_query.line_summary(project)
+    elif operation == "find_untagged":
+        project = data.get("project") or await _detect_open_project()
+        result = plant3d_query.find_untagged(project)
+    else:
+        return _json({"error": f"Unknown plant3d operation: {operation}"})
+
+    return _json(result)
+
+
+async def _detect_open_project() -> str:
+    """Resolve the Plant 3D project of the drawing currently open in AutoCAD.
+
+    Reads the active drawing folder (DWGPREFIX) from the running session via
+    the File IPC backend, then walks up to the project's Project.xml.
+    """
+    from autocad_mcp import plant3d_query
+
+    backend = await get_backend()
+    if backend.name != "file_ipc":
+        raise RuntimeError(
+            f"No hay AutoCAD abierto (backend actual: {backend.name}). "
+            "Abre el proyecto Plant 3D en AutoCAD, o indica 'project' con la "
+            "ruta o el nombre del proyecto."
+        )
+
+    res = await backend.drawing_get_variables(["DWGPREFIX"])
+    if not res.ok:
+        raise RuntimeError(f"No se pudo leer la ruta del dibujo activo: {res.error}")
+    prefix = (res.payload or {}).get("DWGPREFIX")
+    if not prefix:
+        raise RuntimeError(
+            "El dibujo activo no tiene ruta en disco (¿sin guardar?). "
+            "Abre o guarda un dibujo del proyecto."
+        )
+    return str(plant3d_query.find_project_root(prefix))
+
+
+# ==========================================================================
 # Main entry point
 # ==========================================================================
 
