@@ -129,7 +129,7 @@ Modificar: `copy` · `move` · `rotate` · `scale` · `mirror` · `offset` · `a
 ⚠️ `execute_lisp` está documentado pero NO debe usarse (ver regla 1).
 
 ### `plant3d` — Consulta de proyectos Plant 3D (solo lectura)
-`detect_project` · `line_summary` · `list_projects` · `find_untagged` · `validate_specs` · `list_lines`
+`detect_project` · `line_summary` · `list_projects` · `find_untagged` · `validate_specs` · `list_lines` · `list_components`
 Lee directamente las bases SQLite (`.dcf`) del proyecto — **no requiere el plugin .NET**
 y nunca modifica el proyecto (apertura `mode=ro`).
 - `find_untagged` — lista los componentes de tubería SIN número de línea válido
@@ -153,6 +153,15 @@ y nunca modifica el proyecto (apertura `mode=ro`).
   opcionales o tablas de relación). Parámetros: `data["ignore_specs"]` y `data["limit"]` (default
   50, 0 = sin tope). **No disponible vía SQLite:** P&ID de origen y localización física del objeto
   en el dibujo (requieren plugin .NET).
+- `list_components` — lista genérica de componentes de tubería (`PipeRunComponent` ⨝
+  `EngineeringItems` por `PnPID`) con filtros opcionales: `classes` (mapeo canónico: `pipe`,
+  `valve`, `fitting`, `flange`, `instrument`, `support`; valor no canónico = passthrough literal
+  de `PartCategory`; omitido = todas), `line` (por `LineNumberTag`, normalizado TRIM+UPPER),
+  `spec` (por `EngineeringItems.Spec`) y `size` (`{"value", "unit"}` — exige unidad). Parámetro
+  `limit` (default 50, 0 = sin tope; reporta `omitted`, sin truncado silencioso). Salida:
+  `{ok, project, path, limit, filters, count, omitted, by_class, components, notes}`. Cada
+  componente: `pnpid`, `class`, `tag` (saneado; NULL/'?'/'?-?' → None), `description`, `spec`,
+  `size`, `line`. **No localiza el objeto en el dibujo** (sin handle/GUID en SQLite).
 **Por defecto consulta el proyecto que el usuario tiene abierto en AutoCAD:** si no se pasa
 `project`, lee `DWGPREFIX` del dibujo activo (vía backend File IPC) y sube hasta el `Project.xml`.
 También admite `project` explícito (ruta a la carpeta o, con `AUTOCAD_MCP_PLANT3D_ROOT`, el nombre).
@@ -214,9 +223,12 @@ del plugin .NET ni de AutoCAD abierto: se lee el SQLite con el módulo `sqlite3`
   `Spec Sheets\*.pspc`, que también son SQLite — accesibles sin plugin .NET. ·
   `plant3d.list_lines` (LINE LIST completa; estrategia híbrida con `P3dLineGroup` + `EngineeringItems`
   + relación de DWG; implementada, testeada — ~98 tests nuevos, suite total 306 verdes — commiteada
-  2026-06-22, commit `6c40dee`; validado: AIR LIQUIDE HUELVA = 114 líneas).
+  2026-06-22, commit `6c40dee`; validado: AIR LIQUIDE HUELVA = 114 líneas). ·
+  `plant3d.list_components` (lista genérica de componentes con filtros por clase/línea/spec/size;
+  implementada y testeada 2026-06-22, 96 tests nuevos, suite total 402 verdes; validado:
+  AIR LIQUIDE HUELVA = 4666 componentes, `classes=["valve"]` → 357; commit pendiente).
   Detección del proyecto abierto: lee `DWGPREFIX` del dibujo activo y sube hasta `Project.xml`.
-- Las dos herramientas de solo lectura del trío original ya están implementadas vía SQLite.
+- Las herramientas de solo lectura del trío original ya están implementadas vía SQLite.
   **Fase actual: SOLO CONSULTA (decisión 2026-06-22).** La escritura y el plugin .NET quedan aplazados; ver sección siguiente.
 
 ### Plugin .NET para Plant 3D — APLAZADO (fuera del alcance actual)

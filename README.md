@@ -171,6 +171,7 @@ Screenshots use `PrintWindow` (Win32) for the File IPC backend — works even wh
 | `find_untagged` | Piping components without a valid `LineNumberTag` (NULL / empty / `?`), broken down by class (`PartCategory`) and spec. |
 | `validate_specs` | Spec-consistency checks: Spec vs. Required Spec, mixed specs per line, empty/ghost specs, material/schedule outside the spec catalogue. |
 | `list_lines` | The project line list — one row per line number with service, spec, size, insulation, and model DWGs. |
+| `list_components` | Generic piping component list (`PipeRunComponent` ⨝ `EngineeringItems`) with optional filters: `classes` (pipe/valve/fitting/flange/instrument/support), `line`, `spec`, `size` (requires unit). Returns `pnpid`, `class`, `tag`, `description`, `spec`, `size`, `line` per component, plus `by_class` summary and `omitted` count. |
 
 > These operations read the Plant 3D project databases (`.dcf` SQLite files) and spec catalogues (`Spec Sheets\*.pspc`, also SQLite) directly, in **read-only mode** (`mode=ro`). They **do not require the .NET plugin or an open AutoCAD session** — except `detect_project`, which reads `DWGPREFIX` from the active drawing when no project path is supplied. The `plant3d` tool **never modifies the project**.
 >
@@ -233,6 +234,7 @@ project's SQLite databases, with no .NET plugin and no AutoCAD session required:
 - **`find_untagged`** — identify piping components without a valid `LineNumberTag`, broken down by class and spec.
 - **`validate_specs`** — four spec-consistency checks (Spec vs. Required Spec, mixed specs per line, ghost specs, material/schedule outside catalogue).
 - **`list_lines`** — generate the project line list (service, spec, size, insulation, model DWGs) using a hybrid query over `P3dLineGroup` + `EngineeringItems`.
+- **`list_components`** — generic piping component list with optional filters by class, line, spec and size; includes `by_class` breakdown and `omitted` count.
 - **`line_summary`**, **`detect_project`**, **`list_projects`** — project navigation and per-line breakdowns.
 
 All operations open `.dcf` and `.pspc` files with `mode=ro` and never write back to the project.

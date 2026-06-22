@@ -559,6 +559,13 @@ async def plant3d(
                        cabecera, specs reales (y spec_mixed), tamaños por unidad,
                        aislamiento y DWGs del modelo 3D.
                        data: {project?, ignore_specs?, limit?}
+      list_components— Inventario de componentes de tubería con filtros
+                       opcionales: por clase (pipe/valve/fitting/flange/
+                       instrument/support o PartCategory literal), por línea,
+                       por spec y por tamaño (exige unidad: {value, unit}).
+                       Cada componente con pnpid, clase, tag, descripción, spec,
+                       tamaño y línea; incluye desglose por clase.
+                       data: {project?, classes?, line?, spec?, size?, limit?}
       list_projects  — Lista proyectos bajo una raíz. data: {root?}
                        (usa AUTOCAD_MCP_PLANT3D_ROOT si no se indica root)
     """
@@ -582,6 +589,9 @@ async def plant3d(
     elif operation == "list_lines":
         project = data.get("project") or await _detect_open_project()
         result = plant3d_query.list_lines(project, data)
+    elif operation == "list_components":
+        project = data.get("project") or await _detect_open_project()
+        result = plant3d_query.list_components(project, data)
     else:
         return _json({"error": f"Unknown plant3d operation: {operation}"})
 

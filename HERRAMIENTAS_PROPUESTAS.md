@@ -128,10 +128,39 @@ total: 306 tests, todos verdes. Commit `6c40dee` (2026-06-22).
 
 **Valor:** la *line list* es uno de los entregables más solicitados en ingeniería de proceso.
 
-#### B2. `plant3d-list-components`
-Lista componentes de tubería con filtros por clase (pipe, valve, fitting, flange, instrument),
-línea, especificación o diámetro. Devuelve handle, tag, clase y propiedades principales.
-**Valor:** consulta general y base de casi todas las demás.
+#### B2. `plant3d-list-components` — ✅ IMPLEMENTADA (2026-06-22)
+
+Lista genérica de componentes de tubería (`PipeRunComponent` ⨝ `EngineeringItems` por `PnPID`).
+**Solo lectura vía SQLite** (`Piping.dcf`, `mode=ro`) — no requiere el plugin .NET.
+Expuesta como la operación `list_components` del tool `plant3d`.
+
+**Filtros opcionales:**
+- `classes` — lista de clases. Mapeo canónico: `pipe` → Pipe, `valve` → Valves,
+  `fitting` → Fittings + Olet, `flange` → Flanges, `instrument` → Instruments,
+  `support` → PartCategory NULL / '' / Default. Valor no canónico = passthrough literal
+  de `PartCategory`. Omitido = todas las clases.
+- `line` — filtro por `LineNumberTag` (normalizado TRIM+UPPER, coincidencia exacta).
+- `spec` — filtro por `EngineeringItems.Spec` (normalizado exacto).
+- `size` — `{"value", "unit"}`; **exige unidad** (no mezcla in/mm); sin unidad no filtra
+  y genera una nota de advertencia en la salida.
+- `limit` — default 50, 0 = sin tope (reporta `omitted`; sin truncado silencioso).
+
+**Salida:** `{ok, project, path, limit, filters, count, omitted, by_class, components, notes}`.
+Cada componente incluye: `pnpid`, `class`, `tag`, `description`, `spec`, `size`, `line`.
+El campo `tag` (= `PipeRunComponent.Tag`) se sanea: NULL / '' / '?' / '?-?' → None.
+Degrada con gracia si la columna `Tag` no existe en el esquema del proyecto.
+`by_class` usa `(sin clase)` para PartCategory NULL / ''.
+
+**Limitación (igual que las demás tools de consulta):** identifica cada componente por
+`PnPID` + propiedades; **no lo localiza en el dibujo** (sin handle/GUID en SQLite — la
+localización requeriría el plugin .NET).
+
+**Validado:** proyecto `23099 - AIR LIQUIDE HUELVA`: Pipe = 1682, Fittings = 1471,
+Flanges = 431, Valves = 357, Olet = 97, Instruments = 33, total = 4666;
+`classes=["valve"]` → 357. **96 tests nuevos; suite total: 402 tests, todos verdes.**
+Revisada por code-reviewer: aprobada, sin bloqueantes. Implementada 2026-06-22.
+
+**Valor:** consulta general y base de casi todas las demás herramientas de listado.
 
 #### B3. `plant3d-get-component`
 Volcado completo de propiedades de un único componente identificado por handle o tag (todas sus
@@ -232,7 +261,7 @@ origen.
 | Prioridad | Herramienta | Motivo |
 |-----------|-------------|--------|
 | ⭐⭐⭐ | A1. `project-info` | Punto de entrada; valida acceso al proyecto y la BD |
-| ⭐⭐⭐ | B2. `list-components` | Lector base que reutilizan casi todas las demás |
+| ✅ | B2. `list-components` | IMPLEMENTADA (2026-06-22), filtros por clase/línea/spec/size; 96 tests; suite 402 verde |
 | ✅ | B1. `list-lines` | IMPLEMENTADA (2026-06-22), estrategia híbrida P3dLineGroup + EngineeringItems |
 | ✅ | E1. `find-untagged` | IMPLEMENTADA (2026-06-20), solo lectura vía SQLite |
 | ✅ | E2. `validate-specs` | IMPLEMENTADA (2026-06-22), solo lectura vía SQLite + .pspc |

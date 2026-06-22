@@ -1035,3 +1035,260 @@ def list_lines(project: str, data: dict | None = None) -> dict:
         "lines": capped,
         "notes": notes,
     }
+
+
+# ---------------------------------------------------------------------------
+# Component listing (filtered inventory)
+# ---------------------------------------------------------------------------
+
+# Canonical class filter -> set of normalized PartCategory values it maps to.
+# The mapping lets the caller use friendly names ("valve", "fitting") instead
+# of the raw EngineeringItems.PartCategory strings. A value that is none of
+# these canonical keys is treated as a literal PartCategory (passthrough),
+# compared normalized (_norm: TRIM+UPPER).
+_CLASS_MAP: dict[str, set[str]] = {
+    "pipe": {"PIPE"},
+    "valve": {"VALVES"},
+    "fitting": {"FITTINGS", "OLET"},
+    "flange": {"FLANGES"},
+    "instrument": {"INSTRUMENTS"},
+    # "support" is special-cased below: PartCategory NULL / '' / 'DEFAULT'.
+}
+
+# Normalized PartCategory values that identify a pipe support (these components
+# carry no real category in EngineeringItems).
+_SUPPORT_CATEGORIES = {"", "DEFAULT"}
+
+
+def _is_blank_tag(value: str | None) -> bool:
+    """True if ``value`` is an absent component tag.
+
+    Treats NULL, empty, and placeholder tags made only of ``?`` and spaces
+    (e.g. ``?``, ``?-?``, ``? - ?``) as "no tag" — the same lenient criterion
+    used for line tags elsewhere, extended so multi-segment placeholders are
+    also caught.
+    """
+    if value is None:
+        return True
+    stripped = str(value).strip()
+    if stripped in ("", "?"):
+        return True
+    # Only question marks, dashes and whitespace -> placeholder, not a real tag.
+    return all(ch in "?- \t" for ch in stripped)
+
+
+def list_components(project: str, data: dict | None = None) -> dict:
+    """List piping components of a Plant 3D project, optionally filtered.
+
+    Reads ``Piping.dcf`` (``PipeRunComponent`` joined to ``EngineeringItems``
+    by ``PnPID``) and returns one entry per component identified by ``PnPID``
+    plus its engineering properties (class, tag, description, spec, nominal
+    size, line). A single SELECT is issued and every filter is applied in
+    Python — the component volume is small (a few thousand rows).
+
+    ``data`` accepts these optional filters:
+
+    * ``classes`` — list of classes to include. Canonical keys map to one or
+      more ``PartCategory`` values: ``pipe`` -> {Pipe}, ``valve`` -> {Valves},
+      ``fitting`` -> {Fittings, Olet}, ``flange`` -> {Flanges},
+      ``instrument`` -> {Instruments}, ``support`` -> components whose
+      ``PartCategory`` is NULL/empty/``Default``. Any non-canonical value is
+      treated as a literal ``PartCategory`` (passthrough), compared normalized.
+      Omitted/empty means all classes.
+    * ``line`` — keep only components whose ``LineNumberTag`` matches (``_norm``
+      TRIM+UPPER, exact).
+    * ``spec`` — keep only components whose ``EngineeringItems.Spec`` matches
+      (``_norm``, exact).
+    * ``size`` — keep only a given nominal diameter. **Requires a unit** to
+      avoid mixing inches and millimetres: pass ``{"value": <num>, "unit":
+      "in"|"mm"}``. ``size`` without a usable unit is NOT applied (the size
+      filter is skipped and a note is added) rather than guessing a unit.
+    * ``limit`` — max components returned (default 50, 0 = no cap). Omitted
+      components are reported via ``omitted``, never truncated silently.
+
+    Components cannot be located in the drawing from here — that needs the .NET
+    plugin — so they are reported by ``PnPID`` and properties only.
+
+    Schema robustness: ``PipeRunComponent.Tag`` (the per-component tag) is
+    optional and absent in some projects; its presence is probed with
+    ``PRAGMA table_info`` and, when missing, ``tag`` degrades to ``null`` with
+    a note.
+    """
+    data = data or {}
+    project_dir = resolve_project_dir(project)
+    db = _db_path(project_dir, "Piping.dcf")
+
+    limit = data.get("limit", _DEFAULT_LIMIT)
+    notes: list[str] = []
+
+    # --- Parse the class filter into canonical sets + passthrough values ----
+    classes_raw = data.get("classes")
+    want_categories: set[str] = set()   # normalized PartCategory values to keep
+    want_support = False
+    classes_echo: list[str] = []
+    if classes_raw:
+        for c in classes_raw:
+            key = str(c).strip().lower()
+            classes_echo.append(key)
+            if key == "support":
+                want_support = True
+            elif key in _CLASS_MAP:
+                want_categories |= _CLASS_MAP[key]
+            else:
+                # Passthrough: treat as a literal PartCategory value.
+                want_categories.add(_norm(c))
+
+    # --- Parse the size filter (unit is mandatory) --------------------------
+    size_raw = data.get("size")
+    size_value: float | None = None
+    size_unit: str | None = None
+    if size_raw is not None:
+        if isinstance(size_raw, dict):
+            size_value = size_raw.get("value")
+            size_unit = size_raw.get("unit")
+        else:
+            # A bare number with no unit: do not guess in/mm.
+            size_value = size_raw
+        if size_value is None or not (size_unit and str(size_unit).strip()):
+            notes.append(
+                "Filtro 'size' ignorado: requiere unidad explícita "
+                '({"value": <num>, "unit": "in"|"mm"}) para no mezclar in/mm.'
+            )
+            size_value = None
+            size_unit = None
+
+    line_filter = data.get("line")
+    line_norm = _norm(line_filter) if line_filter else None
+    spec_filter = data.get("spec")
+    spec_norm = _norm(spec_filter) if spec_filter else None
+
+    # --- Single SELECT (Tag column probed for graceful degradation) ---------
+    con = _connect_ro(db)
+    try:
+        have_tag = "Tag" in _table_columns(con, "PipeRunComponent")
+        tag_expr = "prc.Tag" if have_tag else "NULL"
+        cur = con.cursor()
+        rows = cur.execute(
+            f"""
+            SELECT
+                prc.PnPID            AS pnpid,
+                ei.PartCategory      AS part_category,
+                ei.ShortDescription  AS description,
+                ei.Spec              AS spec,
+                ei.NominalDiameter   AS dia,
+                ei.NominalUnit       AS unit,
+                prc.LineNumberTag    AS line,
+                {tag_expr}           AS tag
+            FROM PipeRunComponent prc
+            LEFT JOIN EngineeringItems ei ON ei.PnPID = prc.PnPID
+            """
+        ).fetchall()
+    finally:
+        con.close()
+
+    if not have_tag:
+        notes.append(
+            "La columna 'Tag' no existe en PipeRunComponent en este proyecto: "
+            "el tag de componente se devuelve como null."
+        )
+
+    def _class_matches(part_category: str | None) -> bool:
+        """Apply the class filter to a component's PartCategory."""
+        norm_cat = _norm(part_category)
+        is_support = norm_cat in _SUPPORT_CATEGORIES
+        if want_support and is_support:
+            return True
+        return norm_cat in want_categories
+
+    by_class: dict[str, int] = {}
+    components: list[dict] = []
+    apply_class = bool(classes_raw)
+    apply_size = size_value is not None
+
+    for r in rows:
+        # --- class filter ---------------------------------------------------
+        if apply_class and not _class_matches(r["part_category"]):
+            continue
+
+        # --- line filter ----------------------------------------------------
+        if line_norm is not None and _norm(r["line"]) != line_norm:
+            continue
+
+        # --- spec filter ----------------------------------------------------
+        if spec_norm is not None and _norm(r["spec"]) != spec_norm:
+            continue
+
+        # --- size filter (value + unit, units never mixed) ------------------
+        if apply_size:
+            dia = r["dia"]
+            if dia is None:
+                continue
+            try:
+                if abs(float(dia) - float(size_value)) >= 1e-6:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if _norm(r["unit"]) != _norm(size_unit):
+                continue
+
+        # --- sanitize line (blank/placeholder -> None in output) -----------
+        line_val = None if _is_blank_tag(r["line"]) else str(r["line"]).strip()
+
+        # --- sanitize component tag ----------------------------------------
+        tag_val = None if _is_blank_tag(r["tag"]) else str(r["tag"]).strip()
+
+        # --- class label for grouping/counting -----------------------------
+        cls_label = (
+            r["part_category"]
+            if r["part_category"] is not None and str(r["part_category"]).strip()
+            else "(sin clase)"
+        )
+        by_class[cls_label] = by_class.get(cls_label, 0) + 1
+
+        components.append(
+            {
+                "pnpid": r["pnpid"],
+                "class": r["part_category"],
+                "tag": tag_val,
+                "description": r["description"],
+                "spec": r["spec"],
+                "size": _fmt_size(r["dia"], r["unit"]) if r["dia"] is not None else None,
+                "line": line_val,
+            }
+        )
+
+    by_class_ranked = [
+        {"class": name, "count": count}
+        for name, count in sorted(by_class.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+
+    count = len(components)
+    capped, omitted = _capped(components, limit)
+
+    filters_echo: dict = {}
+    if classes_raw:
+        filters_echo["classes"] = classes_echo
+    if line_norm is not None:
+        filters_echo["line"] = line_norm
+    if spec_norm is not None:
+        filters_echo["spec"] = spec_norm
+    if size_value is not None:
+        filters_echo["size"] = {"value": size_value, "unit": _norm(size_unit)}
+
+    notes.append(
+        "La localización del objeto en el dibujo requiere el plugin .NET; "
+        "aquí solo se identifica por PnPID y propiedades."
+    )
+
+    return {
+        "ok": True,
+        "project": project_dir.name,
+        "path": str(project_dir),
+        "limit": limit,
+        "filters": filters_echo,
+        "count": count,
+        "omitted": omitted,
+        "by_class": by_class_ranked,
+        "components": capped,
+        "notes": notes,
+    }
