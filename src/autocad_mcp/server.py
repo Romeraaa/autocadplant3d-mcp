@@ -554,6 +554,11 @@ async def plant3d(
                        líneas con specs mezcladas, specs vacías, specs sin
                        fichero .pspc, y Schedule/Material fuera del catálogo.
                        data: {project?, ignore_specs?, limit?}
+      list_lines     — LINE LIST: una fila por línea (LineNumberTag válido) con
+                       nº de componentes, servicio/spec/tamaño nominal de la
+                       cabecera, specs reales (y spec_mixed), tamaños por unidad,
+                       aislamiento y DWGs del modelo 3D.
+                       data: {project?, ignore_specs?, limit?}
       list_projects  — Lista proyectos bajo una raíz. data: {root?}
                        (usa AUTOCAD_MCP_PLANT3D_ROOT si no se indica root)
     """
@@ -574,6 +579,9 @@ async def plant3d(
     elif operation == "validate_specs":
         project = data.get("project") or await _detect_open_project()
         result = plant3d_query.validate_specs(project, data)
+    elif operation == "list_lines":
+        project = data.get("project") or await _detect_open_project()
+        result = plant3d_query.list_lines(project, data)
     else:
         return _json({"error": f"Unknown plant3d operation: {operation}"})
 

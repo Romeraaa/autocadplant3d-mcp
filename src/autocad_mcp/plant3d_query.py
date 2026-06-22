@@ -331,6 +331,31 @@ def find_untagged(project: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Schema introspection
+# ---------------------------------------------------------------------------
+
+
+def _table_exists(con: sqlite3.Connection, table: str) -> bool:
+    """Return True if ``table`` exists in the database."""
+    row = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def _table_columns(con: sqlite3.Connection, table: str) -> set[str]:
+    """Return the set of column names of ``table`` (empty if it has none/absent).
+
+    Uses ``PRAGMA table_info`` so callers can select only the columns that are
+    actually present — the ``P3dLineGroup`` and ``PnPDrawings`` schemas vary
+    between projects (custom client columns, optional ``IsoNumber``, ...).
+    """
+    rows = con.execute(f'PRAGMA table_info("{table}")').fetchall()
+    return {r["name"] for r in rows}
+
+
+# ---------------------------------------------------------------------------
 # Spec validation
 # ---------------------------------------------------------------------------
 
@@ -711,4 +736,302 @@ def validate_specs(project: str, data: dict | None = None) -> dict:
             "La localización del objeto en el dibujo requiere el plugin .NET; "
             "aquí solo se identifica por PnPID y propiedades."
         ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Line list (LINE LIST)
+# ---------------------------------------------------------------------------
+
+# Columns we read from the P3dLineGroup header when present. Each is optional:
+# the real schema varies per project, so only the existing ones are selected
+# (PRAGMA) and the rest degrade to None.
+_LINEGROUP_HEADER_COLS = (
+    "Service",
+    "NominalSpec",
+    "NominalSize",
+    "InsulationType",
+    "InsulationThickness",
+)
+
+
+def _build_line_aggregates(rows: list) -> dict[str, dict]:
+    """Aggregate piping component rows into per-line records.
+
+    ``rows`` must expose ``line``, ``spec``, ``dia`` and ``unit`` (as in
+    :func:`line_summary`). Returns a mapping ``LineNumberTag -> aggregate``
+    where each aggregate holds the component count, the set of real specs and
+    the per-``(dia, unit)`` size histogram. Kept pure (no I/O) so it can be
+    unit-tested independently of SQLite.
+    """
+    lines: dict[str, dict] = {}
+    for r in rows:
+        agg = lines.setdefault(
+            r["line"],
+            {
+                "line": r["line"],
+                "components": 0,
+                "_specs": set(),   # original spec strings
+                "_sizes": {},      # (dia, unit) -> count
+            },
+        )
+        agg["components"] += 1
+        if r["spec"] and str(r["spec"]).strip():
+            agg["_specs"].add(str(r["spec"]).strip())
+        if r["dia"] is not None:
+            key = (r["dia"], r["unit"])
+            agg["_sizes"][key] = agg["_sizes"].get(key, 0) + 1
+    return lines
+
+
+def _format_sizes(size_hist: dict) -> tuple[str | None, list[str]]:
+    """Return (main_size, sizes) from a ``(dia, unit) -> count`` histogram.
+
+    Sizes are sorted by descending frequency (then by diameter) and formatted
+    with :func:`_fmt_size`, keeping the unit separation so inches and
+    millimetres are never merged into a misleading range. ``main_size`` is the
+    most frequent one.
+    """
+    sizes_sorted = sorted(size_hist.items(), key=lambda kv: (-kv[1], kv[0][0]))
+    sizes = [_fmt_size(dia, unit) for (dia, unit), _ in sizes_sorted]
+    return (sizes[0] if sizes else None), sizes
+
+
+def _spec_mixed(specs: set[str], ignore_specs: set[str]) -> bool:
+    """True if more than one *non-auxiliary* real spec is present.
+
+    ``specs`` are original spec strings; ``ignore_specs`` is a set of
+    *normalized* auxiliary spec names to exclude (same criterion as
+    :func:`validate_specs`).
+    """
+    real = {_norm(s) for s in specs} - ignore_specs
+    return len(real) > 1
+
+
+def list_lines(project: str, data: dict | None = None) -> dict:
+    """Produce the LINE LIST of a Plant 3D project (one row per piping line).
+
+    The grain is one row per *valid* ``PipeRunComponent.LineNumberTag`` (NULL,
+    empty and ``?`` tags are excluded, as in :func:`find_untagged`). Per line it
+    reports, each from its own reliable source:
+
+    * ``components`` — number of components on the line.
+    * ``service`` — from the ``P3dLineGroup`` header (the per-component
+      ``PipeRunComponent.Service`` is contaminated by branches, so it is not
+      used).
+    * ``nominal_spec`` / ``nominal_size`` — from the ``P3dLineGroup`` header.
+    * ``specs`` — distinct real specs aggregated from ``EngineeringItems.Spec``;
+      ``spec_mixed`` is True when more than one non-auxiliary spec coexists.
+    * ``main_size`` / ``sizes`` — the actual nominal diameters in use, kept
+      separate per unit (inches vs millimetres are never mixed into a range).
+    * ``insulation_type`` / ``insulation_thickness`` — from the header. A tag
+      may map to several header groups; distinct non-empty values are returned
+      as a list (a single value when they all agree, ``null`` when absent).
+    * ``model_dwgs`` — the 3D **model** drawings the line lives in (via
+      ``P3dDrawingLineGroupRelationship`` → ``PnPDrawings."Dwg Name"``). This is
+      NOT the source P&ID.
+
+    Schema robustness: the ``P3dLineGroup`` and ``PnPDrawings`` schemas vary per
+    project, so columns are probed with ``PRAGMA table_info`` and only existing
+    ones are selected; missing pieces degrade gracefully to ``null``/``[]`` with
+    a note. ``data`` accepts ``ignore_specs`` (auxiliary specs excluded from the
+    ``spec_mixed`` check) and ``limit`` (max lines returned; defaults to 50,
+    0 = no cap — omitted lines are reported, never truncated silently).
+    """
+    data = data or {}
+    project_dir = resolve_project_dir(project)
+    db = _db_path(project_dir, "Piping.dcf")
+
+    ignore_raw = data.get("ignore_specs")
+    ignore_specs = {
+        _norm(s)
+        for s in (ignore_raw if ignore_raw is not None else _DEFAULT_IGNORE_SPECS)
+    }
+    limit = data.get("limit", _DEFAULT_LIMIT)
+
+    notes: list[str] = []
+
+    con = _connect_ro(db)
+    try:
+        cur = con.cursor()
+
+        # --- Component aggregation (specs + sizes) per valid line ----------
+        comp_rows = cur.execute(
+            """
+            SELECT
+                prc.LineNumberTag    AS line,
+                ei.Spec              AS spec,
+                ei.NominalDiameter   AS dia,
+                ei.NominalUnit       AS unit
+            FROM PipeRunComponent prc
+            LEFT JOIN EngineeringItems ei ON ei.PnPID = prc.PnPID
+            WHERE prc.LineNumberTag IS NOT NULL
+              AND TRIM(prc.LineNumberTag) NOT IN ('', '?')
+            """
+        ).fetchall()
+        aggregates = _build_line_aggregates(comp_rows)
+
+        # --- Header (P3dLineGroup) per Tag, schema-tolerant ----------------
+        # A tag may correspond to several header groups; we keep, per tag,
+        # the distinct non-empty values of each selected column. The dict is
+        # keyed by the *normalized* tag (_norm: TRIM+UPPER) so the cross with
+        # the component grain matches despite leading/trailing spaces or case
+        # differences between LineNumberTag and P3dLineGroup.Tag.
+        header: dict[str, dict[str, set[str]]] = {}
+        have_header = _table_exists(con, "P3dLineGroup")
+        present_cols: list[str] = []
+        if have_header:
+            cols = _table_columns(con, "P3dLineGroup")
+            if "Tag" not in cols:
+                have_header = False
+            else:
+                present_cols = [c for c in _LINEGROUP_HEADER_COLS if c in cols]
+        if have_header:
+            select_cols = ", ".join(f'"{c}"' for c in ["Tag", *present_cols])
+            hrows = cur.execute(
+                f"SELECT {select_cols} FROM P3dLineGroup"
+            ).fetchall()
+            for r in hrows:
+                tag = r["Tag"]
+                if not tag or str(tag).strip() in ("", "?"):
+                    continue
+                key = _norm(tag)
+                bucket = header.setdefault(key, {c: set() for c in present_cols})
+                for c in present_cols:
+                    val = r[c]
+                    if val is not None and str(val).strip():
+                        bucket[c].add(str(val).strip())
+            missing = [c for c in _LINEGROUP_HEADER_COLS if c not in present_cols]
+            if missing:
+                notes.append(
+                    "Columnas ausentes en P3dLineGroup (devueltas como null): "
+                    + ", ".join(missing)
+                    + "."
+                )
+        else:
+            notes.append(
+                "No se encontró la cabecera P3dLineGroup (o sin columna 'Tag'): "
+                "service, nominal_spec, nominal_size e insulation se devuelven "
+                "como null."
+            )
+
+        # --- Model drawings per line via relation table --------------------
+        # Keyed by the *normalized* tag, consistent with ``header``.
+        dwgs_by_tag: dict[str, set[str]] = {}
+        have_rel = (
+            have_header
+            and _table_exists(con, "P3dDrawingLineGroupRelationship")
+            and _table_exists(con, "PnPDrawings")
+        )
+        if have_rel:
+            # Guard not only the tables' existence but the specific columns the
+            # JOIN relies on: the relation needs LineGroup/Drawing and the
+            # drawings table needs PnPID and "Dwg Name". A missing column would
+            # otherwise raise sqlite3.OperationalError and break the whole tool,
+            # so we degrade to model_dwgs=[] plus a note instead.
+            rel_cols = _table_columns(con, "P3dDrawingLineGroupRelationship")
+            dwg_cols = _table_columns(con, "PnPDrawings")
+            missing_rel = [c for c in ("LineGroup", "Drawing") if c not in rel_cols]
+            missing_dwg = [c for c in ("PnPID", "Dwg Name") if c not in dwg_cols]
+            if missing_rel or missing_dwg:
+                have_rel = False
+                faltan = ", ".join(
+                    [f"P3dDrawingLineGroupRelationship.{c}" for c in missing_rel]
+                    + [f'PnPDrawings."{c}"' for c in missing_dwg]
+                )
+                notes.append(
+                    "Columnas ausentes para el cruce de dibujos del modelo "
+                    f"({faltan}): model_dwgs vacío."
+                )
+        if have_rel:
+            # P3dLineGroup.PnPID = relationship.LineGroup ; relationship.Drawing
+            # = PnPDrawings.PnPID. Resolve the model DWG name per line Tag.
+            try:
+                rel_rows = cur.execute(
+                    """
+                    SELECT lg.Tag AS tag, d."Dwg Name" AS dwg
+                    FROM P3dLineGroup lg
+                    JOIN P3dDrawingLineGroupRelationship rel
+                      ON rel.LineGroup = lg.PnPID
+                    JOIN PnPDrawings d
+                      ON d.PnPID = rel.Drawing
+                    """
+                ).fetchall()
+            except sqlite3.Error:
+                # Any other schema incompatibility (e.g. a missing PnPID on
+                # P3dLineGroup) degrades gracefully rather than failing.
+                rel_rows = []
+                notes.append(
+                    "No se pudo resolver el cruce de dibujos del modelo "
+                    "(incompatibilidad de esquema): model_dwgs vacío."
+                )
+            for r in rel_rows:
+                tag = r["tag"]
+                if not tag or str(tag).strip() in ("", "?"):
+                    continue
+                key = _norm(tag)
+                if r["dwg"] and str(r["dwg"]).strip():
+                    dwgs_by_tag.setdefault(key, set()).add(str(r["dwg"]).strip())
+        else:
+            notes.append(
+                "Sin relación de dibujos del modelo disponible: model_dwgs vacío."
+            )
+    finally:
+        con.close()
+
+    def _hval(key: str, col: str):
+        """Single value (or list, or None) of a header column for a match key.
+
+        ``key`` is the *normalized* tag (_norm) used to cross the component
+        grain with the header — never the raw LineNumberTag.
+        """
+        vals = sorted(header.get(key, {}).get(col, set()))
+        if not vals:
+            return None
+        return vals[0] if len(vals) == 1 else vals
+
+    lines_out: list[dict] = []
+    for agg in aggregates.values():
+        tag = agg["line"]            # raw LineNumberTag — kept as-is in output
+        key = _norm(tag)             # normalized match key for header/dwgs cross
+        main_size, sizes = _format_sizes(agg["_sizes"])
+        lines_out.append(
+            {
+                "line": tag,
+                "components": agg["components"],
+                "service": _hval(key, "Service"),
+                "nominal_spec": _hval(key, "NominalSpec"),
+                "nominal_size": _hval(key, "NominalSize"),
+                "specs": sorted(agg["_specs"]),
+                "spec_mixed": _spec_mixed(agg["_specs"], ignore_specs),
+                "main_size": main_size,
+                "sizes": sizes,
+                "insulation_type": _hval(key, "InsulationType"),
+                "insulation_thickness": _hval(key, "InsulationThickness"),
+                "model_dwgs": sorted(dwgs_by_tag.get(key, set())),
+            }
+        )
+
+    lines_out.sort(key=lambda d: d["line"])
+    count = len(lines_out)
+    capped, omitted = _capped(lines_out, limit)
+
+    notes.append(
+        "El 'P&ID de origen' y la localización del objeto en el dibujo NO están "
+        "disponibles vía SQLite (requerirían el plugin .NET); 'model_dwgs' es el "
+        "DWG del MODELO 3D, no el P&ID."
+    )
+
+    return {
+        "ok": True,
+        "project": project_dir.name,
+        "path": str(project_dir),
+        "limit": limit,
+        "ignore_specs": sorted(
+            ignore_raw if ignore_raw is not None else _DEFAULT_IGNORE_SPECS
+        ),
+        "count": count,
+        "omitted": omitted,
+        "lines": capped,
+        "notes": notes,
     }
