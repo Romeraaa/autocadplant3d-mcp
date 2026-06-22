@@ -149,10 +149,17 @@ capa como se planteó inicialmente.
 **Conteos validados:** AIR LIQUIDE HUELVA = 1158 untagged de 4666 · PI2588002 = 7.
 **Valor:** detectar elementos huérfanos antes de generar isométricos o informes.
 
-#### E2. `plant3d-validate-specs`
-Detecta componentes cuya `SpecName` no coincide con la de la línea padre (p. ej. un componente
-clase 600 en una línea clase 300). Reporta handle, spec del componente y spec de la línea.
-*(Ya estaba previsto.)*
+#### E2. `plant3d-validate-specs` — ✅ IMPLEMENTADA (2026-06-22)
+Valida coherencia de especificaciones cruzando `Piping.dcf` con los catálogos `Spec Sheets\*.pspc`
+(ambos SQLite). **Solo lectura** — no requiere el plugin .NET.
+Cuatro comprobaciones: (1) Spec ≠ Required Spec de la línea; (2) specs mezcladas dentro de un
+mismo `LineNumberTag`; (3) componentes con spec vacía/NULL; (4) spec fantasma (usada en el
+proyecto pero sin `.pspc` en el catálogo) y material/schedule fuera de catálogo.
+**Hallazgo clave:** los catálogos de specs (`Spec Sheets\*.pspc`) también son SQLite, accesibles
+directamente con Python. Degrada con gracia si la carpeta no existe o un `.pspc` es ilegible.
+Parámetros: `data["ignore_specs"]` (excluir specs auxiliares) y `data["limit"]` (acotar salida).
+Identifica componentes por `PnPID` + propiedades; **no los localiza en el dibujo** (sin handle).
+65 tests nuevos; suite total: 208 tests, todos verdes. Commit `f4ecdab`.
 **Valor:** evitar errores de especificación que disparan rechazos en revisión.
 
 #### E3. `plant3d-find-missing-properties`
@@ -186,7 +193,7 @@ origen.
 | ⭐⭐⭐ | B2. `list-components` | Lector base que reutilizan casi todas las demás |
 | ⭐⭐⭐ | B1. `list-lines` | Line list — entregable de máximo valor |
 | ✅ | E1. `find-untagged` | IMPLEMENTADA (2026-06-20), solo lectura vía SQLite |
-| ⭐⭐ | E2. `validate-specs` | Ya previsto; evita errores caros de spec |
+| ✅ | E2. `validate-specs` | IMPLEMENTADA (2026-06-22), solo lectura vía SQLite + .pspc |
 | ⭐⭐ | B5. `list-valves` / B6. `list-instruments` | Entregables habituales |
 | ⭐⭐ | D1. `bom` / D2. `pipe-length` | Medición automática |
 | ⭐⭐ | E4. `pid-vs-3d-consistency` | Comprobación muy costosa a mano |

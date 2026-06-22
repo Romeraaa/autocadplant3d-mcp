@@ -129,13 +129,20 @@ Modificar: `copy` · `move` · `rotate` · `scale` · `mirror` · `offset` · `a
 ⚠️ `execute_lisp` está documentado pero NO debe usarse (ver regla 1).
 
 ### `plant3d` — Consulta de proyectos Plant 3D (solo lectura)
-`detect_project` · `line_summary` · `list_projects` · `find_untagged`
+`detect_project` · `line_summary` · `list_projects` · `find_untagged` · `validate_specs`
 Lee directamente las bases SQLite (`.dcf`) del proyecto — **no requiere el plugin .NET**
 y nunca modifica el proyecto (apertura `mode=ro`).
 - `find_untagged` — lista los componentes de tubería SIN número de línea válido
   (`LineNumberTag` NULL, vacío o `?`), con desglose por clase (`PartCategory`) y por spec.
   Identifica cada componente por `PnPID` + propiedades; **no lo localiza en el dibujo**
   (no hay handle/GUID en el SQLite — eso requeriría el plugin .NET).
+- `validate_specs` — valida coherencia de especificaciones cruzando `Piping.dcf` con los
+  catálogos `Spec Sheets\*.pspc` (también SQLite). Cuatro comprobaciones: (1) Spec ≠ Required
+  Spec de la línea; (2) specs mezcladas dentro de un mismo `LineNumberTag`; (3) spec vacía/NULL;
+  (4) spec fantasma (usada en el proyecto pero sin fichero `.pspc` en el catálogo) y
+  material/schedule fuera de catálogo. Degrada con gracia si no existe la carpeta `Spec Sheets`
+  o un `.pspc` es ilegible. Parámetros: `data["ignore_specs"]` (lista de specs auxiliares a
+  excluir) y `data["limit"]` (acota la salida). Identifica componentes por `PnPID` + propiedades.
 **Por defecto consulta el proyecto que el usuario tiene abierto en AutoCAD:** si no se pasa
 `project`, lee `DWGPREFIX` del dibujo activo (vía backend File IPC) y sube hasta el `Project.xml`.
 También admite `project` explícito (ruta a la carpeta o, con `AUTOCAD_MCP_PLANT3D_ROOT`, el nombre).
@@ -188,9 +195,13 @@ del plugin .NET ni de AutoCAD abierto: se lee el SQLite con el módulo `sqlite3`
   SpoolNumber...), `EngineeringItems` (Spec, NominalDiameter, Material, Schedule...), unidas por `PnPID`.
 - Proyectos de prueba en `\\172.16.0.220\Comun\06-INFORMÁTICA\3_UTILIDADES\MCP-Plant3D\Proyectos`.
 - Implementado: `plant3d.detect_project` · `plant3d.line_summary` · `plant3d.list_projects` ·
-  `plant3d.find_untagged` (componentes sin `LineNumberTag` válido; implementada y testeada 2026-06-20).
+  `plant3d.find_untagged` (componentes sin `LineNumberTag` válido; implementada y testeada 2026-06-20) ·
+  `plant3d.validate_specs` (validación de coherencia de especificaciones; implementada, testeada y
+  commiteada 2026-06-22, commit `f4ecdab`). **Hallazgo:** los catálogos de specs viven en
+  `Spec Sheets\*.pspc`, que también son SQLite — accesibles sin plugin .NET.
   Detección del proyecto abierto: lee `DWGPREFIX` del dibujo activo y sube hasta `Project.xml`.
-- Siguiente candidato (ya viable sin plugin): `validate-specs`.
+- Las dos herramientas de solo lectura del trío original ya están implementadas vía SQLite.
+  Siguiente: `plant3d-assign-layers-by-property` (escritura — requiere plugin .NET).
 
 ### Plugin .NET para Plant 3D (solo necesario para ESCRITURA)
 Plugin C# (`plant3d-plugin/PlantMcpDispatch.dll`) con APIs de Plant 3D (`Autodesk.ProcessPower.*`).
@@ -202,8 +213,8 @@ no para consultas. AutoLISP no puede acceder a estas APIs.
 
 Las 3 herramientas originalmente previstas:
 - `plant3d-find-untagged` — componentes sin `LineNumberTag` (lectura → ✅ IMPLEMENTADA vía SQLite, 2026-06-20, como `plant3d.find_untagged`)
-- `plant3d-validate-specs` — detecta incompatibilidades de especificación (lectura → ya viable vía SQLite)
-- `plant3d-assign-layers-by-property` — asigna capas según propiedades (escritura → requiere plugin)
+- `plant3d-validate-specs` — detecta incompatibilidades de especificación (lectura → ✅ IMPLEMENTADA vía SQLite, 2026-06-22, como `plant3d.validate_specs`; catálogo `Spec Sheets\*.pspc` también SQLite)
+- `plant3d-assign-layers-by-property` — asigna capas según propiedades (escritura → requiere plugin .NET; pendiente)
 
 DLLs disponibles en `C:\Program Files\Autodesk\AutoCAD 2026\PLNT3D\`.
 
