@@ -1292,3 +1292,18 @@ def list_components(project: str, data: dict | None = None) -> dict:
         "components": capped,
         "notes": notes,
     }
+
+
+def list_valves(project: str, data: dict | None = None) -> dict:
+    """List valve components of a Plant 3D project (preset of ``list_components``).
+
+    Thin wrapper that calls :func:`list_components` with the class filter pinned
+    to ``valve`` (i.e. ``EngineeringItems.PartCategory`` == ``Valves``). Any
+    ``classes`` value supplied by the caller is ignored and overridden. All
+    other filters (``line``, ``spec``, ``size``, ``limit``) are forwarded as-is.
+    The caller's ``data`` dict is never mutated. Output shape is identical to
+    :func:`list_components`.
+    """
+    merged = dict(data or {})
+    merged["classes"] = ["valve"]  # pin class; ignore/override any caller 'classes'
+    return list_components(project, merged)
