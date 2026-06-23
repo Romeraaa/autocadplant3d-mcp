@@ -129,7 +129,7 @@ Modificar: `copy` · `move` · `rotate` · `scale` · `mirror` · `offset` · `a
 ⚠️ `execute_lisp` está documentado pero NO debe usarse (ver regla 1).
 
 ### `plant3d` — Consulta de proyectos Plant 3D (solo lectura)
-`detect_project` · `line_summary` · `list_projects` · `find_untagged` · `validate_specs` · `list_lines` · `list_components` · `list_valves` · `list_instruments`
+`detect_project` · `line_summary` · `list_projects` · `find_untagged` · `validate_specs` · `list_lines` · `list_components` · `list_valves` · `list_instruments` · `bom`
 Lee directamente las bases SQLite (`.dcf`) del proyecto — **no requiere el plugin .NET**
 y nunca modifica el proyecto (apertura `mode=ro`).
 - `find_untagged` — lista los componentes de tubería SIN número de línea válido
@@ -173,6 +173,17 @@ y nunca modifica el proyecto (apertura `mode=ro`).
   `classes` que pase el usuario se ignora; se conservan los filtros restantes: `line`, `spec`,
   `size` (`{"value", "unit"}`), `limit` (default 50, 0 = sin tope). Salida idéntica a
   `list_components`. **No localiza el objeto en el dibujo** (sin handle/GUID en SQLite).
+- `bom` — genera el Bill of Materials del proyecto. Solo lectura; NO emite SQL propio: agrega
+  internamente la salida de `list_components` (`PipeRunComponent` ⨝ `EngineeringItems`).
+  Agrupa los componentes por la tupla **(clase, spec, tamaño, descripción)** — cada combinación
+  distinta es una línea de BOM con su `quantity` (recuento de componentes; no mide longitudes).
+  Admite los mismos filtros de alcance que `list_components`: `classes`, `line`, `spec`,
+  `size` (`{"value", "unit"}`), y `limit` (default 50, 0 = sin tope) que acota el número de
+  LÍNEAS de BOM, no de componentes individuales. Clase None/vacía se etiqueta `"(sin clase)"`;
+  spec/size/description None se conservan como None. Salida: `{ok, project, path, limit,
+  filters, total_components, line_count, omitted, by_class, bom, notes}`; cada línea de BOM:
+  `{class, spec, size, description, quantity}`. No aplica la limitación de localización en el
+  dibujo (un BOM no localiza objetos).
 **Por defecto consulta el proyecto que el usuario tiene abierto en AutoCAD:** si no se pasa
 `project`, lee `DWGPREFIX` del dibujo activo (vía backend File IPC) y sube hasta el `Project.xml`.
 También admite `project` explícito (ruta a la carpeta o, con `AUTOCAD_MCP_PLANT3D_ROOT`, el nombre).
@@ -241,7 +252,8 @@ del plugin .NET ni de AutoCAD abierto: se lee el SQLite con el módulo `sqlite3`
   `plant3d.list_valves` (preset de `list_components` con `classes=["valve"]` fijado; implementada
   y testeada 2026-06-23, 52 tests nuevos, suite total 454 verdes; commit pendiente). ·
   `plant3d.list_instruments` (preset de `list_components` con `classes=["instrument"]` fijado;
-  implementada y testeada 2026-06-23, 52 tests nuevos, suite total 506 verdes; commit pendiente).
+  implementada y testeada 2026-06-23, 52 tests nuevos, suite total 506 verdes; commit pendiente). ·
+  `plant3d.bom` (Bill of Materials — agregación de `list_components` por la tupla clase/spec/tamaño/descripción con `quantity` por recuento; implementada y testeada 2026-06-23, 72 tests nuevos, suite total 578 verdes; apta para commit).
   Detección del proyecto abierto: lee `DWGPREFIX` del dibujo activo y sube hasta `Project.xml`.
 - Las herramientas de solo lectura del trío original ya están implementadas vía SQLite.
   **Fase actual: SOLO CONSULTA (decisión 2026-06-22).** La escritura y el plugin .NET quedan aplazados; ver sección siguiente.

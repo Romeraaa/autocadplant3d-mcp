@@ -574,6 +574,12 @@ async def plant3d(
                        con la clase fijada a 'instrument' (cualquier 'classes' se
                        ignora). Admite los demás filtros (línea, spec, tamaño) y limit.
                        data: {project?, line?, spec?, size?, limit?}
+      bom            — Bill of Materials: agrega los componentes por
+                       (clase, spec, tamaño, descripción) con su cantidad
+                       (recuento de componentes, no longitudes). Admite los
+                       mismos filtros de alcance que list_components; aquí limit
+                       acota el nº de líneas de BOM devueltas.
+                       data: {project?, classes?, line?, spec?, size?, limit?}
       list_projects  — Lista proyectos bajo una raíz. data: {root?}
                        (usa AUTOCAD_MCP_PLANT3D_ROOT si no se indica root)
     """
@@ -606,6 +612,9 @@ async def plant3d(
     elif operation == "list_instruments":
         project = data.get("project") or await _detect_open_project()
         result = plant3d_query.list_instruments(project, data)
+    elif operation == "bom":
+        project = data.get("project") or await _detect_open_project()
+        result = plant3d_query.bom(project, data)
     else:
         return _json({"error": f"Unknown plant3d operation: {operation}"})
 

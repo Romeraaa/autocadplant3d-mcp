@@ -1322,3 +1322,108 @@ def list_instruments(project: str, data: dict | None = None) -> dict:
     merged = dict(data or {})
     merged["classes"] = ["instrument"]  # pin class; ignore/override any caller 'classes'
     return list_components(project, merged)
+
+
+def bom(project: str, data: dict | None = None) -> dict:
+    """Build the Bill of Materials of a Plant 3D project by aggregating components.
+
+    This is an aggregation on top of :func:`list_components`: it does NOT emit
+    its own SQL. It calls :func:`list_components` as the base reader (with no
+    cap) so that class mapping, tag sanitisation and size formatting stay
+    consistent, then groups the returned components in Python.
+
+    Grouping key is the tuple ``(class, spec, size, description)`` — each distinct
+    combination is one BOM line with a quantity (the count of components in that
+    group). ``spec``, ``size`` and ``description`` may be ``None`` and are kept
+    as-is on the line (and as valid key values). A ``None``/empty ``class`` is
+    normalised to the label ``"(sin clase)"`` for output/ordering only (``None``
+    and ``""`` collapse into the same group).
+
+    ``data`` accepts the same scope filters as :func:`list_components`
+    (``classes``, ``line``, ``spec``, ``size``) plus ``limit`` — but here
+    ``limit`` caps the number of BOM LINES returned (default 50, 0 = no cap),
+    not the number of components. The caller's ``data`` dict is never mutated.
+
+    Quantities are component counts, not lengths (pipe length is a separate
+    tool). The drawing-location note from the base reader is not propagated, as
+    it does not apply to a BOM; the ignored-``size`` note is kept when present.
+    """
+    data = data or {}
+    limit = data.get("limit", _DEFAULT_LIMIT)
+
+    # Read every matching component (no inner cap) so we aggregate over all.
+    inner = list_components(
+        project,
+        {
+            "classes": data.get("classes"),
+            "line": data.get("line"),
+            "spec": data.get("spec"),
+            "size": data.get("size"),
+            "limit": 0,  # no cap: aggregate over all components
+        },
+    )
+
+    # --- aggregate components into BOM lines ------------------------------
+    # key -> {"class", "spec", "size", "description", "quantity"}
+    groups: dict[tuple, dict] = {}
+    by_class: dict[str, int] = {}
+    for comp in inner["components"]:
+        cls_raw = comp.get("class")
+        cls_label = (
+            cls_raw
+            if cls_raw is not None and str(cls_raw).strip()
+            else "(sin clase)"
+        )
+        spec = comp.get("spec")
+        size = comp.get("size")
+        desc = comp.get("description")
+        key = (cls_label, spec, size, desc)
+        line = groups.get(key)
+        if line is None:
+            groups[key] = {
+                "class": cls_label,
+                "spec": spec,
+                "size": size,
+                "description": desc,
+                "quantity": 1,
+            }
+        else:
+            line["quantity"] += 1
+        by_class[cls_label] = by_class.get(cls_label, 0) + 1
+
+    # --- order: class asc, quantity desc, description asc (None last) -----
+    lineas = sorted(
+        groups.values(),
+        key=lambda b: (b["class"], -b["quantity"], b["description"] or ""),
+    )
+
+    by_class_ranked = [
+        {"class": name, "count": count}
+        for name, count in sorted(by_class.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+
+    capped, omitted = _capped(lineas, limit)
+
+    # --- notes: keep relevant inner notes, drop the .NET-location one -----
+    notes: list[str] = [
+        n for n in inner["notes"] if "plugin .NET" not in n
+    ]
+    notes.append(
+        "Cada línea del BOM agrupa componentes por (clase, spec, tamaño, "
+        "descripción); la cantidad es el recuento de componentes, no longitudes "
+        "(la longitud de tubería es otra herramienta)."
+    )
+
+    return {
+        "ok": True,
+        "project": inner["project"],
+        "path": inner["path"],
+        "limit": limit,
+        "filters": inner["filters"],
+        "total_components": len(inner["components"]),
+        "line_count": len(lineas),
+        "omitted": omitted,
+        "by_class": by_class_ranked,
+        "bom": capped,
+        "notes": notes,
+    }
