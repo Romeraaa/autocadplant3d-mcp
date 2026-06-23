@@ -570,6 +570,10 @@ async def plant3d(
                        clase fijada a 'valve' (cualquier 'classes' se ignora).
                        Admite los demás filtros (línea, spec, tamaño) y limit.
                        data: {project?, line?, spec?, size?, limit?}
+      list_instruments — Inventario de instrumentos: preset de list_components
+                       con la clase fijada a 'instrument' (cualquier 'classes' se
+                       ignora). Admite los demás filtros (línea, spec, tamaño) y limit.
+                       data: {project?, line?, spec?, size?, limit?}
       list_projects  — Lista proyectos bajo una raíz. data: {root?}
                        (usa AUTOCAD_MCP_PLANT3D_ROOT si no se indica root)
     """
@@ -599,6 +603,9 @@ async def plant3d(
     elif operation == "list_valves":
         project = data.get("project") or await _detect_open_project()
         result = plant3d_query.list_valves(project, data)
+    elif operation == "list_instruments":
+        project = data.get("project") or await _detect_open_project()
+        result = plant3d_query.list_instruments(project, data)
     else:
         return _json({"error": f"Unknown plant3d operation: {operation}"})
 

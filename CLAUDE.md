@@ -129,7 +129,7 @@ Modificar: `copy` · `move` · `rotate` · `scale` · `mirror` · `offset` · `a
 ⚠️ `execute_lisp` está documentado pero NO debe usarse (ver regla 1).
 
 ### `plant3d` — Consulta de proyectos Plant 3D (solo lectura)
-`detect_project` · `line_summary` · `list_projects` · `find_untagged` · `validate_specs` · `list_lines` · `list_components` · `list_valves`
+`detect_project` · `line_summary` · `list_projects` · `find_untagged` · `validate_specs` · `list_lines` · `list_components` · `list_valves` · `list_instruments`
 Lee directamente las bases SQLite (`.dcf`) del proyecto — **no requiere el plugin .NET**
 y nunca modifica el proyecto (apertura `mode=ro`).
 - `find_untagged` — lista los componentes de tubería SIN número de línea válido
@@ -168,6 +168,11 @@ y nunca modifica el proyecto (apertura `mode=ro`).
   tope). Salida idéntica a `list_components`: `{ok, project, path, limit, filters, count,
   omitted, by_class, components, notes}`. **No localiza el objeto en el dibujo** (sin
   handle/GUID en SQLite).
+- `list_instruments` — preset de solo lectura de `list_components` con la clase fijada a
+  instrumento (`classes=["instrument"]`, mapea a `PartCategory="Instruments"`). Cualquier
+  `classes` que pase el usuario se ignora; se conservan los filtros restantes: `line`, `spec`,
+  `size` (`{"value", "unit"}`), `limit` (default 50, 0 = sin tope). Salida idéntica a
+  `list_components`. **No localiza el objeto en el dibujo** (sin handle/GUID en SQLite).
 **Por defecto consulta el proyecto que el usuario tiene abierto en AutoCAD:** si no se pasa
 `project`, lee `DWGPREFIX` del dibujo activo (vía backend File IPC) y sube hasta el `Project.xml`.
 También admite `project` explícito (ruta a la carpeta o, con `AUTOCAD_MCP_PLANT3D_ROOT`, el nombre).
@@ -234,7 +239,9 @@ del plugin .NET ni de AutoCAD abierto: se lee el SQLite con el módulo `sqlite3`
   implementada y testeada 2026-06-22, 96 tests nuevos, suite total 402 verdes; validado:
   AIR LIQUIDE HUELVA = 4666 componentes, `classes=["valve"]` → 357; commit `31ab90c`). ·
   `plant3d.list_valves` (preset de `list_components` con `classes=["valve"]` fijado; implementada
-  y testeada 2026-06-23, 52 tests nuevos, suite total 454 verdes; commit pendiente).
+  y testeada 2026-06-23, 52 tests nuevos, suite total 454 verdes; commit pendiente). ·
+  `plant3d.list_instruments` (preset de `list_components` con `classes=["instrument"]` fijado;
+  implementada y testeada 2026-06-23, 52 tests nuevos, suite total 506 verdes; commit pendiente).
   Detección del proyecto abierto: lee `DWGPREFIX` del dibujo activo y sube hasta `Project.xml`.
 - Las herramientas de solo lectura del trío original ya están implementadas vía SQLite.
   **Fase actual: SOLO CONSULTA (decisión 2026-06-22).** La escritura y el plugin .NET quedan aplazados; ver sección siguiente.
