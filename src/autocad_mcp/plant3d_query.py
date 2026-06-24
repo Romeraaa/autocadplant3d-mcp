@@ -1797,3 +1797,489 @@ def pipe_length(project: str, data: dict | None = None) -> dict:
         "groups": capped,
         "notes": notes,
     }
+
+
+# ---------------------------------------------------------------------------
+# Weld list (weld count / breakdown)
+# ---------------------------------------------------------------------------
+
+# Tablas dedicadas de soldaduras en Piping.dcf, una fila por soldadura.
+# La clave del mapa es la etiqueta de subtipo (weld_type) que se expone en la
+# salida; el valor es el nombre real de la tabla en el SQLite.
+_WELD_TABLES = {
+    "butt": "Buttweld",
+    "socket": "Socketweld",
+    "tap": "TapWeld",
+}
+
+# Subtipos válidos para el filtro weld_type (las claves de _WELD_TABLES).
+_WELD_TYPES = tuple(_WELD_TABLES.keys())
+
+# Claves canónicas de agrupación admitidas por weld_list.
+_WELD_GROUP_BY = ("line", "size", "spec", "shop_field", "type")
+
+# Etiqueta para soldaduras sin Shop_Field reconocible (NULL o fuera de
+# {SHOP, FIELD}).
+_UNKNOWN_SHOP_FIELD = "(desconocido)"
+
+
+def _norm_shop_field(value: str | None) -> str:
+    """Normalize a Shop_Field value to ``"shop"`` / ``"field"`` / unknown.
+
+    The ``Shop_Field`` column holds SHOP / FIELD; anything else (NULL, blank or
+    an unexpected token) collapses to :data:`_UNKNOWN_SHOP_FIELD`.
+    """
+    v = _norm(value)
+    if v == "SHOP":
+        return "shop"
+    if v == "FIELD":
+        return "field"
+    return _UNKNOWN_SHOP_FIELD
+
+
+def _build_weld_aggregates(
+    rows: list, group_by: str
+) -> tuple[dict, dict, dict, int, dict]:
+    """Aggregate raw weld rows into per-group counts. Pure (no I/O).
+
+    ``rows`` must expose ``weld_type`` (``"butt"``/``"socket"``/``"tap"``),
+    ``shop_field`` (already normalized to ``"shop"``/``"field"``/unknown via
+    :func:`_norm_shop_field`), ``line`` (the resolved raw line Tag, or None),
+    ``spec``, ``dia`` and ``dia_unit`` (as produced by :func:`weld_list`'s base
+    join). Every row is exactly one weld, so the unit of aggregation is a count.
+
+    The grouping key depends on ``group_by``:
+
+    * ``"line"`` — the raw resolved line Tag; welds with a blank/placeholder or
+      absent Tag (``_is_blank_tag``) are grouped under :data:`_NO_LINE_LABEL`.
+    * ``"size"`` — the nominal diameter formatted with :func:`_fmt_size`, kept
+      separate per unit (inches vs millimetres are never merged).
+    * ``"spec"`` — the ``EngineeringItems.Spec`` (None/empty -> ``"(sin spec)"``).
+    * ``"shop_field"`` — the normalized Shop_Field (shop/field/unknown).
+    * ``"type"`` — the weld subtype (butt/socket/tap).
+
+    Returns ``(groups, by_type, by_shop_field, total_count, untagged)``:
+
+    * ``groups`` — ``group_value -> weld_count``.
+    * ``by_type`` — ``weld_type -> weld_count`` over every row (global breakdown).
+    * ``by_shop_field`` — ``shop_field -> weld_count`` over every row (global).
+    * ``total_count`` — total number of welds in scope.
+    * ``untagged`` — ``{"weld_count"}`` for welds whose resolved line Tag is
+      blank/placeholder/absent (reported regardless of group_by).
+    """
+    groups: dict[str, int] = {}
+    by_type: dict[str, int] = {}
+    by_shop_field: dict[str, int] = {}
+    total_count = 0
+    untagged = {"weld_count": 0}
+
+    for r in rows:
+        total_count += 1
+
+        wtype = r["weld_type"]
+        by_type[wtype] = by_type.get(wtype, 0) + 1
+
+        sf = r["shop_field"]
+        by_shop_field[sf] = by_shop_field.get(sf, 0) + 1
+
+        # Las soldaduras sin línea válida se reportan SIEMPRE en 'untagged'.
+        is_untagged = _is_blank_tag(r["line"])
+        if is_untagged:
+            untagged["weld_count"] += 1
+
+        # --- clave de agrupación según group_by ----------------------------
+        if group_by == "size":
+            gkey = (
+                _fmt_size(r["dia"], r["dia_unit"]) if r["dia"] is not None else "?"
+            )
+        elif group_by == "spec":
+            spec = r["spec"]
+            gkey = str(spec).strip() if spec and str(spec).strip() else "(sin spec)"
+        elif group_by == "shop_field":
+            gkey = sf
+        elif group_by == "type":
+            gkey = wtype
+        else:  # "line"
+            gkey = _NO_LINE_LABEL if is_untagged else str(r["line"]).strip()
+
+        groups[gkey] = groups.get(gkey, 0) + 1
+
+    return groups, by_type, by_shop_field, total_count, untagged
+
+
+def weld_list(project: str, data: dict | None = None) -> dict:
+    """Count and break down the welds of a Plant 3D project, grouped and filtered.
+
+    Welds live in three dedicated tables in ``Piping.dcf`` — ``Buttweld``,
+    ``Socketweld`` and ``TapWeld`` — one row per weld, each carrying ``PnPID``,
+    ``Shop_Field`` and ``WeldNumber``. The weld subtype (``"butt"``/``"socket"``/
+    ``"tap"``) is derived from which table a row comes from. Each weld joins 1:1
+    to ``EngineeringItems`` by ``PnPID`` for its nominal diameter (size) and
+    spec, and its line is resolved via ``P3dLineGroupPartRelationship`` →
+    ``P3dLineGroup.Tag`` (weld.PnPID = relationship.Part ; relationship.LineGroup
+    = P3dLineGroup.PnPID).
+
+    ``WeldNumber`` is **not** used: it is NULL in practice (weld numbering is
+    assigned on the isometrics), so this tool counts and breaks down welds, it
+    does not number them.
+
+    ``data`` accepts:
+
+    * ``group_by`` — ``"line"`` (default) | ``"size"`` | ``"spec"`` |
+      ``"shop_field"`` | ``"type"``: the key the returned groups are aggregated
+      by. For ``"line"``, welds without a valid resolved line Tag are grouped
+      under ``"(SIN LÍNEA)"``; for the others they fall into their natural group.
+      An unrecognized value falls back to ``"line"`` with a note.
+    * ``line`` — keep only welds whose resolved line Tag matches (``_norm``
+      TRIM+UPPER, exact).
+    * ``spec`` — keep only welds whose ``EngineeringItems.Spec`` matches
+      (``_norm``, exact).
+    * ``size`` — keep only a given nominal **diameter**; requires a unit
+      (``{"value": <num>, "unit": "in"|"mm"}``); without a usable unit the filter
+      is skipped and a note is added (same handling as :func:`list_components`).
+    * ``shop_field`` — ``"shop"`` | ``"field"`` (normalized): keep only welds of
+      that fabrication kind.
+    * ``weld_type`` — ``"butt"`` | ``"socket"`` | ``"tap"``: keep only that
+      subtype.
+    * ``limit`` — max GROUPS returned (default 50, 0 = no cap). Omitted groups
+      are reported via ``omitted``, never truncated silently.
+
+    ``by_type`` and ``by_shop_field`` are global breakdowns (over the filtered
+    scope) always present, independent of ``group_by``. Welds without a valid
+    line are always reported in a top-level ``untagged`` field. The caller's
+    ``data`` dict is never mutated.
+
+    Schema robustness: each weld table and its columns (``PnPID``,
+    ``Shop_Field``) are probed with ``PRAGMA table_info`` before querying. If
+    NONE of the three tables exists the tool degrades gracefully (``ok: True``,
+    zero welds, empty lists, explanatory note). Present-but-not-all tables are
+    used with a note for the absent ones; a missing ``Shop_Field`` column makes
+    that table's welds ``"(desconocido)"`` with a note. If the line-resolution
+    tables/columns (``P3dLineGroupPartRelationship.Part``/``.LineGroup``,
+    ``P3dLineGroup.PnPID``/``.Tag``) are absent, every weld degrades to untagged
+    /``"(SIN LÍNEA)"`` plus a note instead of raising.
+    """
+    data = data or {}
+    project_dir = resolve_project_dir(project)
+    db = _db_path(project_dir, "Piping.dcf")
+
+    # --- group_by (validado; default "line") -------------------------------
+    group_by = str(data.get("group_by") or "line").strip().lower()
+    notes: list[str] = []
+    if group_by not in _WELD_GROUP_BY:
+        notes.append(
+            f"group_by '{group_by}' no reconocido; se usa 'line' "
+            "(válidos: line, size, spec, shop_field, type)."
+        )
+        group_by = "line"
+
+    limit = data.get("limit", _DEFAULT_LIMIT)
+
+    # --- filtros de alcance (misma semántica que list_components) ----------
+    line_filter = data.get("line")
+    line_norm = _norm(line_filter) if line_filter else None
+    spec_filter = data.get("spec")
+    spec_norm = _norm(spec_filter) if spec_filter else None
+
+    # shop_field: "shop" | "field" (normalizado). Valor no reconocido se ignora.
+    shop_field_raw = data.get("shop_field")
+    shop_field_norm: str | None = None
+    if shop_field_raw is not None and str(shop_field_raw).strip():
+        sf = _norm_shop_field(shop_field_raw)
+        if sf in ("shop", "field"):
+            shop_field_norm = sf
+        else:
+            notes.append(
+                f"Filtro 'shop_field' '{shop_field_raw}' no reconocido "
+                "(válidos: shop, field); se ignora."
+            )
+
+    # weld_type: "butt" | "socket" | "tap". Valor no reconocido se ignora.
+    weld_type_raw = data.get("weld_type")
+    weld_type_norm: str | None = None
+    if weld_type_raw is not None and str(weld_type_raw).strip():
+        wt = str(weld_type_raw).strip().lower()
+        if wt in _WELD_TYPES:
+            weld_type_norm = wt
+        else:
+            notes.append(
+                f"Filtro 'weld_type' '{weld_type_raw}' no reconocido "
+                "(válidos: butt, socket, tap); se ignora."
+            )
+
+    # size: filtra por DIÁMETRO nominal y exige unidad (no se adivina in/mm).
+    size_raw = data.get("size")
+    size_value: float | None = None
+    size_unit: str | None = None
+    if size_raw is not None:
+        if isinstance(size_raw, dict):
+            size_value = size_raw.get("value")
+            size_unit = size_raw.get("unit")
+        else:
+            size_value = size_raw
+        if size_value is None or not (size_unit and str(size_unit).strip()):
+            notes.append(
+                "Filtro 'size' ignorado: requiere unidad explícita "
+                '({"value": <num>, "unit": "in"|"mm"}) para no mezclar in/mm. '
+                "Filtra el diámetro nominal."
+            )
+            size_value = None
+            size_unit = None
+
+    def _filters_echo_weld() -> dict:
+        """Echo de los filtros aplicados (estilo list_components)."""
+        echo: dict = {}
+        if line_norm is not None:
+            echo["line"] = line_norm
+        if spec_norm is not None:
+            echo["spec"] = spec_norm
+        if size_value is not None:
+            echo["size"] = {"value": size_value, "unit": _norm(size_unit)}
+        if shop_field_norm is not None:
+            echo["shop_field"] = shop_field_norm
+        if weld_type_norm is not None:
+            echo["weld_type"] = weld_type_norm
+        return echo
+
+    def _base_response(extra_notes: list[str]) -> dict:
+        """Respuesta degradada (ok) cuando no hay soldaduras que contar."""
+        return {
+            "ok": True,
+            "project": project_dir.name,
+            "path": str(project_dir),
+            "limit": limit,
+            "group_by": group_by,
+            "filters": _filters_echo_weld(),
+            "total_welds": 0,
+            "by_type": [],
+            "by_shop_field": [],
+            "untagged": {"weld_count": 0},
+            "group_count": 0,
+            "omitted": 0,
+            "groups": [],
+            "notes": notes + extra_notes,
+        }
+
+    con = _connect_ro(db)
+    try:
+        # --- robustez de esquema: qué tablas de soldadura existen -----------
+        # Para cada subtipo presente, comprobamos también si tiene Shop_Field
+        # (PnPID es imprescindible para el cruce; si falta, la tabla se omite).
+        present: dict[str, dict] = {}  # weld_type -> {"table", "have_shop_field"}
+        absent_types: list[str] = []
+        for wtype, table in _WELD_TABLES.items():
+            if weld_type_norm is not None and wtype != weld_type_norm:
+                # Si se filtró por un subtipo concreto, ignoramos los demás.
+                continue
+            if not _table_exists(con, table):
+                absent_types.append(wtype)
+                continue
+            cols = _table_columns(con, table)
+            if "PnPID" not in cols:
+                absent_types.append(wtype)
+                continue
+            present[wtype] = {
+                "table": table,
+                "have_shop_field": "Shop_Field" in cols,
+            }
+
+        if not present:
+            # Ninguna tabla de soldadura utilizable.
+            if weld_type_norm is not None:
+                msg = (
+                    f"El proyecto no expone la tabla de soldaduras "
+                    f"'{_WELD_TABLES[weld_type_norm]}' (subtipo '{weld_type_norm}') "
+                    "en Piping.dcf."
+                )
+            else:
+                msg = (
+                    "El proyecto no expone ninguna tabla de soldaduras "
+                    "(Buttweld/Socketweld/TapWeld) en Piping.dcf; las soldaduras "
+                    "no están disponibles vía SQLite."
+                )
+            return _base_response([msg])
+
+        if absent_types and weld_type_norm is None:
+            faltan = ", ".join(_WELD_TABLES[t] for t in absent_types)
+            notes.append(
+                f"Tablas de soldadura ausentes (omitidas): {faltan}."
+            )
+        # Tablas presentes pero sin Shop_Field: sus soldaduras serán
+        # "(desconocido)" en el desglose taller/campo.
+        no_sf = [
+            _WELD_TABLES[t] for t, info in present.items() if not info["have_shop_field"]
+        ]
+        if no_sf:
+            notes.append(
+                "Sin columna 'Shop_Field' en: "
+                + ", ".join(no_sf)
+                + f"; sus soldaduras se cuentan como '{_UNKNOWN_SHOP_FIELD}'."
+            )
+
+        # --- mapa PnPID de soldadura -> Tag de línea ------------------------
+        # Resuelto vía P3dLineGroupPartRelationship (Part = PnPID del componente,
+        # LineGroup = PnPID de la cabecera) ⨝ P3dLineGroup (Tag). Degradamos a
+        # mapa vacío (todas untagged) si faltan tablas o columnas.
+        line_by_pnpid: dict[str, str] = {}
+        have_rel = _table_exists(
+            con, "P3dLineGroupPartRelationship"
+        ) and _table_exists(con, "P3dLineGroup")
+        if have_rel:
+            rel_cols = _table_columns(con, "P3dLineGroupPartRelationship")
+            lg_cols = _table_columns(con, "P3dLineGroup")
+            missing_rel = [c for c in ("Part", "LineGroup") if c not in rel_cols]
+            missing_lg = [c for c in ("PnPID", "Tag") if c not in lg_cols]
+            if missing_rel or missing_lg:
+                have_rel = False
+                faltan = ", ".join(
+                    [f"P3dLineGroupPartRelationship.{c}" for c in missing_rel]
+                    + [f"P3dLineGroup.{c}" for c in missing_lg]
+                )
+                notes.append(
+                    "Columnas ausentes para resolver la línea de las soldaduras "
+                    f"({faltan}): todas se reportan sin línea."
+                )
+        else:
+            notes.append(
+                "Sin tablas de relación línea-componente "
+                "(P3dLineGroupPartRelationship / P3dLineGroup): las soldaduras "
+                "se reportan sin línea."
+            )
+        if have_rel:
+            try:
+                rel_rows = con.execute(
+                    """
+                    SELECT rel.Part AS part, lg.Tag AS tag
+                    FROM P3dLineGroupPartRelationship rel
+                    JOIN P3dLineGroup lg ON lg.PnPID = rel.LineGroup
+                    """
+                ).fetchall()
+            except sqlite3.Error:
+                rel_rows = []
+                notes.append(
+                    "No se pudo resolver la línea de las soldaduras "
+                    "(incompatibilidad de esquema): se reportan sin línea."
+                )
+            for r in rel_rows:
+                part = r["part"]
+                tag = r["tag"]
+                if part is None:
+                    continue
+                if tag is not None and str(tag).strip():
+                    # Un PnPID se asocia a una sola línea; el primero gana.
+                    line_by_pnpid.setdefault(str(part), str(tag).strip())
+
+        # --- SELECT plano por cada tabla de soldadura presente --------------
+        # Casamos 1:1 con EngineeringItems por PnPID (spec + diámetro). La línea
+        # se resuelve en Python con line_by_pnpid (no en SQL) igual que el resto
+        # del módulo agrega tras leer.
+        raw_rows: list[dict] = []
+        cur = con.cursor()
+        for wtype, info in present.items():
+            sf_expr = "w.Shop_Field" if info["have_shop_field"] else "NULL"
+            wrows = cur.execute(
+                f"""
+                SELECT
+                    w.PnPID            AS pnpid,
+                    {sf_expr}          AS shop_field,
+                    ei.Spec            AS spec,
+                    ei.NominalDiameter AS dia,
+                    ei.NominalUnit     AS dia_unit
+                FROM "{info['table']}" w
+                LEFT JOIN EngineeringItems ei ON ei.PnPID = w.PnPID
+                """
+            ).fetchall()
+            for r in wrows:
+                pnpid = r["pnpid"]
+                raw_rows.append(
+                    {
+                        "weld_type": wtype,
+                        "shop_field": _norm_shop_field(r["shop_field"]),
+                        "spec": r["spec"],
+                        "dia": r["dia"],
+                        "dia_unit": r["dia_unit"],
+                        # Línea resuelta (raw Tag) o None si no hay relación.
+                        "line": line_by_pnpid.get(str(pnpid)) if pnpid is not None else None,
+                    }
+                )
+    finally:
+        con.close()
+
+    # --- aplicar filtros de alcance en Python (una sola pasada) ------------
+    # weld_type ya se acotó al elegir las tablas presentes.
+    apply_size = size_value is not None
+    filtered: list[dict] = []
+    for r in raw_rows:
+        if line_norm is not None and _norm(r["line"]) != line_norm:
+            continue
+        if spec_norm is not None and _norm(r["spec"]) != spec_norm:
+            continue
+        if shop_field_norm is not None and r["shop_field"] != shop_field_norm:
+            continue
+        if apply_size:
+            dia = r["dia"]
+            if dia is None:
+                continue
+            try:
+                if abs(float(dia) - float(size_value)) >= 1e-6:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if _norm(r["dia_unit"]) != _norm(size_unit):
+                continue
+        filtered.append(r)
+
+    # --- agregación pura ----------------------------------------------------
+    groups, by_type, by_shop_field, total_count, untagged = _build_weld_aggregates(
+        filtered, group_by
+    )
+
+    # --- grupos de salida (ordenados por recuento desc, valor asc) ----------
+    groups_out = [
+        {"group": gkey, "weld_count": count}
+        for gkey, count in sorted(
+            groups.items(), key=lambda kv: (-kv[1], str(kv[0]))
+        )
+    ]
+    group_count = len(groups_out)
+    capped, omitted = _capped(groups_out, limit)
+
+    # --- desgloses globales (siempre presentes), ranked desc ----------------
+    by_type_ranked = [
+        {"type": name, "count": count}
+        for name, count in sorted(by_type.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+    by_shop_field_ranked = [
+        {"shop_field": name, "count": count}
+        for name, count in sorted(by_shop_field.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+
+    notes.append(
+        "WeldNumber no se usa (NULL en el proyecto; la numeración se asigna en "
+        "los isométricos): esta herramienta cuenta y desglosa, no numera."
+    )
+    notes.append(
+        "Cobertura de línea parcial: un pequeño % de soldaduras puede no tener "
+        "línea válida resuelta (van a 'untagged'), coherente con find_untagged."
+    )
+    notes.append(
+        "Origen: tablas Buttweld/Socketweld/TapWeld de Piping.dcf; el subtipo "
+        "(type) se deriva de la tabla de origen."
+    )
+
+    return {
+        "ok": True,
+        "project": project_dir.name,
+        "path": str(project_dir),
+        "limit": limit,
+        "group_by": group_by,
+        "filters": _filters_echo_weld(),
+        "total_welds": total_count,
+        "by_type": by_type_ranked,
+        "by_shop_field": by_shop_field_ranked,
+        "untagged": {"weld_count": untagged["weld_count"]},
+        "group_count": group_count,
+        "omitted": omitted,
+        "groups": capped,
+        "notes": notes,
+    }

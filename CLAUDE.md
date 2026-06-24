@@ -129,7 +129,7 @@ Modificar: `copy` · `move` · `rotate` · `scale` · `mirror` · `offset` · `a
 ⚠️ `execute_lisp` está documentado pero NO debe usarse (ver regla 1).
 
 ### `plant3d` — Consulta de proyectos Plant 3D (solo lectura)
-`detect_project` · `line_summary` · `list_projects` · `find_untagged` · `validate_specs` · `list_lines` · `list_components` · `list_valves` · `list_instruments` · `bom` · `pipe_length`
+`detect_project` · `line_summary` · `list_projects` · `find_untagged` · `validate_specs` · `list_lines` · `list_components` · `list_valves` · `list_instruments` · `bom` · `pipe_length` · `weld_list`
 Lee directamente las bases SQLite (`.dcf`) del proyecto — **no requiere el plugin .NET**
 y nunca modifica el proyecto (apertura `mode=ro`).
 - `find_untagged` — lista los componentes de tubería SIN número de línea válido
@@ -202,6 +202,25 @@ y nunca modifica el proyecto (apertura `mode=ro`).
   (PRAGMA): degrada con gracia (ok:True, groups vacíos, totales 0, nota) si falta la tabla
   `Pipe`, la columna `Length` o `LengthUnit`. **No localiza el objeto en el dibujo** (sin
   handle/GUID en SQLite — requeriría plugin .NET).
+- `weld_list` — recuento y desglose de soldaduras del proyecto. Solo lectura; consulta las
+  tres tablas dedicadas de `Piping.dcf`: **`Buttweld`**, **`Socketweld`** y **`TapWeld`**
+  (el subtipo — butt/socket/tap — deriva de la tabla de origen). Cada soldadura se casa por
+  `PnPID` con `EngineeringItems` (diámetro/spec) y con `PipeRunComponent`; la línea se
+  resuelve vía `P3dLineGroupPartRelationship` → `P3dLineGroup.Tag` (~97% de cobertura).
+  El campo `Shop_Field` está poblado (SHOP/FIELD) → desglose taller vs. campo siempre
+  presente. `WeldNumber` es 100% NULL (numeración isométrica aún no asignada) → la
+  herramienta CUENTA y DESGLOSA, NO numera. Parámetros (`data`): `group_by` (`"line"` por
+  defecto | `"size"` | `"spec"` | `"shop_field"` | `"type"`); filtros `line`, `spec`,
+  `size` (`{"value","unit"}` — exige unidad), `shop_field` (`"shop"` | `"field"`),
+  `weld_type` (`"butt"` | `"socket"` | `"tap"`); `limit` (default 50, 0 = sin tope; acota
+  el número de GRUPOS, reporta `omitted`). Salida: `{ok, project, path, limit, group_by,
+  filters, total_welds, by_type[], by_shop_field[], untagged{weld_count}, group_count,
+  omitted, groups[], notes}`. `by_type` y `by_shop_field` son desgloses globales siempre
+  presentes (orden descendente). Soldaduras sin línea válida se reportan en `untagged` y,
+  cuando `group_by="line"`, además como grupo `"(SIN LÍNEA)"`. Robusto a variaciones de
+  esquema (PRAGMA): degrada con gracia (ok:True, total 0, listas vacías, nota) si faltan
+  las tres tablas, la columna `Shop_Field` o las tablas/columnas de relación de línea.
+  **No localiza el objeto en el dibujo** (sin handle/GUID en SQLite — requeriría plugin .NET).
 **Por defecto consulta el proyecto que el usuario tiene abierto en AutoCAD:** si no se pasa
 `project`, lee `DWGPREFIX` del dibujo activo (vía backend File IPC) y sube hasta el `Project.xml`.
 También admite `project` explícito (ruta a la carpeta o, con `AUTOCAD_MCP_PLANT3D_ROOT`, el nombre).
@@ -276,7 +295,15 @@ del plugin .NET ni de AutoCAD abierto: se lee el SQLite con el módulo `sqlite3`
   unidad desde `LengthUnit`; group_by line/spec/size; tramos sin línea en campo `untagged` y grupo
   `"(SIN LÍNEA)"`; implementada y testeada 2026-06-24, 101 tests nuevos, suite total 679 verdes,
   test de integración real incluido; validado: AIR LIQUIDE HUELVA = 1679 tramos ≈ 1.635.082 mm,
-  con línea válida 1300 tramos ≈ 1.333.000 mm, untagged 379 tramos ≈ 302.000 mm; commit pendiente).
+  con línea válida 1300 tramos ≈ 1.333.000 mm, untagged 379 tramos ≈ 302.000 mm; commit pendiente). ·
+  `plant3d.weld_list` (recuento y desglose de soldaduras — tablas `Buttweld`/`Socketweld`/`TapWeld`;
+  subtipo desde tabla de origen; línea vía `P3dLineGroupPartRelationship` → `P3dLineGroup.Tag`,
+  ~97% cobertura; `Shop_Field` poblado (SHOP/FIELD), `WeldNumber` 100% NULL; group_by
+  line/size/spec/shop_field/type; filtros line/spec/size/shop_field/weld_type; soldaduras sin
+  línea en `untagged` y grupo `"(SIN LÍNEA)"`; implementada, testeada y revisada 2026-06-24,
+  162 tests nuevos, suite total 841 verdes, test de integración real incluido; validado:
+  AIR LIQUIDE HUELVA = 2953 soldaduras — Buttweld 2382 / Socketweld 365 / TapWeld 206, ~97%
+  con línea válida; commit pendiente).
   Detección del proyecto abierto: lee `DWGPREFIX` del dibujo activo y sube hasta `Project.xml`.
 - Las herramientas de solo lectura del trío original ya están implementadas vía SQLite.
   **Fase actual: SOLO CONSULTA (decisión 2026-06-22).** La escritura y el plugin .NET quedan aplazados; ver sección siguiente.

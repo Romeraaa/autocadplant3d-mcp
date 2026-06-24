@@ -588,6 +588,18 @@ async def plant3d(
                        de LengthUnit (no asumida). Aquí limit acota el nº de
                        grupos devueltos.
                        data: {project?, group_by?, line?, spec?, size?, limit?}
+      weld_list      — Recuento y desglose de soldaduras (tablas Buttweld/
+                       Socketweld/TapWeld; el subtipo type se deriva de la
+                       tabla). Agrupa por group_by (line|size|spec|shop_field|
+                       type; default line) y admite filtros por línea, spec,
+                       tamaño (diámetro; exige unidad), shop_field (shop|field)
+                       y weld_type (butt|socket|tap). Devuelve siempre los
+                       desgloses globales by_type y by_shop_field, y reporta
+                       aparte las soldaduras sin línea (untagged). No usa
+                       WeldNumber (NULL; numeración isométrica): cuenta y
+                       desglosa, no numera. Aquí limit acota el nº de grupos.
+                       data: {project?, group_by?, line?, spec?, size?,
+                       shop_field?, weld_type?, limit?}
       list_projects  — Lista proyectos bajo una raíz. data: {root?}
                        (usa AUTOCAD_MCP_PLANT3D_ROOT si no se indica root)
     """
@@ -626,6 +638,9 @@ async def plant3d(
     elif operation == "pipe_length":
         project = data.get("project") or await _detect_open_project()
         result = plant3d_query.pipe_length(project, data)
+    elif operation == "weld_list":
+        project = data.get("project") or await _detect_open_project()
+        result = plant3d_query.weld_list(project, data)
     else:
         return _json({"error": f"Unknown plant3d operation: {operation}"})
 
