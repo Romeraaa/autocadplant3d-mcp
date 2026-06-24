@@ -1077,6 +1077,23 @@ def _is_blank_tag(value: str | None) -> bool:
     return all(ch in "?- \t" for ch in stripped)
 
 
+def _filters_echo(
+    line_norm: str | None,
+    spec_norm: str | None,
+    size_value: float | None,
+    size_unit: str | None,
+) -> dict:
+    """Build the applied-filters echo (same style as :func:`list_components`)."""
+    filters_echo: dict = {}
+    if line_norm is not None:
+        filters_echo["line"] = line_norm
+    if spec_norm is not None:
+        filters_echo["spec"] = spec_norm
+    if size_value is not None:
+        filters_echo["size"] = {"value": size_value, "unit": _norm(size_unit)}
+    return filters_echo
+
+
 def list_components(project: str, data: dict | None = None) -> dict:
     """List piping components of a Plant 3D project, optionally filtered.
 
@@ -1425,5 +1442,358 @@ def bom(project: str, data: dict | None = None) -> dict:
         "omitted": omitted,
         "by_class": by_class_ranked,
         "bom": capped,
+        "notes": notes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Pipe length (total run lengths)
+# ---------------------------------------------------------------------------
+
+# Las claves canónicas de agrupación admitidas por pipe_length.
+_PIPE_LENGTH_GROUP_BY = ("line", "spec", "size")
+
+# Etiqueta para los tramos sin número de línea válido cuando se agrupa por línea
+# (mismo criterio visual que line_summary).
+_NO_LINE_LABEL = "(SIN LÍNEA)"
+
+
+def _build_pipe_length_aggregates(
+    rows: list, group_by: str
+) -> tuple[dict, dict, int, dict]:
+    """Aggregate raw pipe rows into per-group length totals. Pure (no I/O).
+
+    ``rows`` must expose ``line``, ``spec``, ``dia``, ``dia_unit``,
+    ``length_unit`` and ``length`` (as produced by :func:`pipe_length`'s base
+    SELECT). Lengths are summed **per length unit** — totals of different
+    ``LengthUnit`` are never collapsed into one figure (in practice a project
+    uses a single unit, but mixed units are kept separate and reported).
+
+    The grouping key depends on ``group_by``:
+
+    * ``"line"`` — the raw ``LineNumberTag``; rows with a blank/placeholder tag
+      (``_is_blank_tag``) are grouped under :data:`_NO_LINE_LABEL`.
+    * ``"spec"`` — the ``EngineeringItems.Spec`` (None/empty -> ``"(sin spec)"``).
+    * ``"size"`` — the nominal diameter formatted with :func:`_fmt_size`, kept
+      separate per unit (inches vs millimetres are never merged).
+
+    Returns a tuple ``(groups, totals_by_unit, total_count, untagged)``:
+
+    * ``groups`` — ``group_value -> {pipe_count, lengths: {unit -> sum}}``.
+    * ``totals_by_unit`` — ``length_unit -> total length`` over every row.
+    * ``total_count`` — total number of pipe rows in scope.
+    * ``untagged`` — ``{"pipe_count", "lengths": {unit -> sum}}`` for rows whose
+      ``LineNumberTag`` is blank/placeholder (reported regardless of group_by).
+    """
+    groups: dict[str, dict] = {}
+    totals_by_unit: dict[str, float] = {}
+    total_count = 0
+    untagged = {"pipe_count": 0, "lengths": {}}
+
+    for r in rows:
+        length = r["length"]
+        # Sin longitud no se puede acumular el tramo; se ignora (NO se cuenta).
+        if length is None:
+            continue
+        try:
+            length_val = float(length)
+        except (TypeError, ValueError):
+            continue
+
+        # La unidad de longitud forma parte de la identidad del total: nunca se
+        # mezclan longitudes de distinta LengthUnit. None -> clave "?".
+        lunit = r["length_unit"]
+        lunit_key = str(lunit).strip() if lunit and str(lunit).strip() else "?"
+
+        total_count += 1
+        totals_by_unit[lunit_key] = totals_by_unit.get(lunit_key, 0.0) + length_val
+
+        # Los tramos sin línea válida se reportan SIEMPRE en 'untagged'.
+        is_untagged = _is_blank_tag(r["line"])
+        if is_untagged:
+            untagged["pipe_count"] += 1
+            untagged["lengths"][lunit_key] = (
+                untagged["lengths"].get(lunit_key, 0.0) + length_val
+            )
+
+        # --- clave de agrupación según group_by ----------------------------
+        if group_by == "spec":
+            spec = r["spec"]
+            gkey = str(spec).strip() if spec and str(spec).strip() else "(sin spec)"
+        elif group_by == "size":
+            gkey = (
+                _fmt_size(r["dia"], r["dia_unit"]) if r["dia"] is not None else "?"
+            )
+        else:  # "line"
+            gkey = (
+                _NO_LINE_LABEL if is_untagged else str(r["line"]).strip()
+            )
+
+        grp = groups.setdefault(gkey, {"pipe_count": 0, "lengths": {}})
+        grp["pipe_count"] += 1
+        grp["lengths"][lunit_key] = grp["lengths"].get(lunit_key, 0.0) + length_val
+
+    return groups, totals_by_unit, total_count, untagged
+
+
+def _round_lengths(lengths: dict[str, float]) -> dict[str, float] | float:
+    """Round a ``unit -> sum`` map to 2 decimals.
+
+    Collapses to a single number when only one unit is present (the common
+    case); otherwise returns the per-unit dict so distinct units stay separate.
+    """
+    rounded = {u: round(v, 2) for u, v in lengths.items()}
+    if len(rounded) == 1:
+        return next(iter(rounded.values()))
+    return rounded
+
+
+def pipe_length(project: str, data: dict | None = None) -> dict:
+    """Sum real pipe run lengths of a Plant 3D project, grouped and filtered.
+
+    Lengths live in the dedicated ``Pipe`` table (one row per pipe run,
+    ``PartCategory='Pipe'``), joined to ``EngineeringItems`` and
+    ``PipeRunComponent`` by ``PnPID``. The column read is ``Pipe.Length``;
+    ``CutLength`` and the fixed-length columns are ignored. Lengths from valves,
+    fittings, etc. are NOT included (those tables' ``Length`` is a physical
+    component dimension, not a run length).
+
+    The length unit is read from ``EngineeringItems.LengthUnit`` (never assumed)
+    and treated as part of the total's identity: lengths of different units are
+    never collapsed into one figure (a project normally uses a single unit). The
+    diameter unit (``NominalUnit``) is orthogonal and only used for the
+    ``size`` grouping/filter.
+
+    ``data`` accepts:
+
+    * ``group_by`` — ``"line"`` (default) | ``"spec"`` | ``"size"``: the key the
+      returned groups are aggregated by. For ``"line"``, pipe runs without a
+      valid ``LineNumberTag`` are grouped under ``"(SIN LÍNEA)"``; for ``"spec"``
+      / ``"size"`` they fall into their natural spec/size group.
+    * ``line`` — keep only runs whose ``LineNumberTag`` matches (``_norm``
+      TRIM+UPPER, exact).
+    * ``spec`` — keep only runs whose ``EngineeringItems.Spec`` matches
+      (``_norm``, exact).
+    * ``size`` — keep only a given nominal **diameter**; requires a unit
+      (``{"value": <num>, "unit": "in"|"mm"}``); without a usable unit the filter
+      is skipped and a note is added (same handling as :func:`list_components`).
+    * ``limit`` — max GROUPS returned (default 50, 0 = no cap). Omitted groups
+      are reported via ``omitted``, never truncated silently.
+
+    Untagged pipe runs (blank/``?`` ``LineNumberTag``) are always reported in a
+    top-level ``untagged`` field, independently of ``group_by``. The caller's
+    ``data`` dict is never mutated.
+
+    Schema robustness: the ``Pipe`` table and its ``Length`` column are probed
+    with ``PRAGMA table_info`` before querying; if either is absent the tool
+    degrades gracefully (``ok: True``, empty groups, zero totals, explanatory
+    note) instead of raising. ``EngineeringItems.LengthUnit`` is likewise
+    optional and degrades to ``length_unit: null`` with a note.
+    """
+    data = data or {}
+    project_dir = resolve_project_dir(project)
+    db = _db_path(project_dir, "Piping.dcf")
+
+    # --- group_by (validado; default "line") -------------------------------
+    group_by = str(data.get("group_by") or "line").strip().lower()
+    notes: list[str] = []
+    if group_by not in _PIPE_LENGTH_GROUP_BY:
+        notes.append(
+            f"group_by '{group_by}' no reconocido; se usa 'line' "
+            "(válidos: line, spec, size)."
+        )
+        group_by = "line"
+
+    limit = data.get("limit", _DEFAULT_LIMIT)
+
+    # --- filtros de alcance (misma semántica que list_components) ----------
+    line_filter = data.get("line")
+    line_norm = _norm(line_filter) if line_filter else None
+    spec_filter = data.get("spec")
+    spec_norm = _norm(spec_filter) if spec_filter else None
+
+    # size: filtra por DIÁMETRO nominal y exige unidad (no se adivina in/mm).
+    size_raw = data.get("size")
+    size_value: float | None = None
+    size_unit: str | None = None
+    if size_raw is not None:
+        if isinstance(size_raw, dict):
+            size_value = size_raw.get("value")
+            size_unit = size_raw.get("unit")
+        else:
+            size_value = size_raw
+        if size_value is None or not (size_unit and str(size_unit).strip()):
+            notes.append(
+                "Filtro 'size' ignorado: requiere unidad explícita "
+                '({"value": <num>, "unit": "in"|"mm"}) para no mezclar in/mm. '
+                "Filtra el diámetro nominal, no la longitud."
+            )
+            size_value = None
+            size_unit = None
+
+    def _base_response(extra_notes: list[str]) -> dict:
+        """Respuesta degradada (ok) cuando no hay longitudes que sumar."""
+        filters_echo = _filters_echo(line_norm, spec_norm, size_value, size_unit)
+        return {
+            "ok": True,
+            "project": project_dir.name,
+            "path": str(project_dir),
+            "limit": limit,
+            "group_by": group_by,
+            "filters": filters_echo,
+            "length_unit": None,
+            "total_pipe_count": 0,
+            "total_length": 0,
+            "untagged": {"pipe_count": 0, "length": 0},
+            "group_count": 0,
+            "omitted": 0,
+            "groups": [],
+            "notes": notes + extra_notes,
+        }
+
+    con = _connect_ro(db)
+    try:
+        # --- robustez de esquema: Pipe + Pipe.Length deben existir ----------
+        if not _table_exists(con, "Pipe"):
+            return _base_response(
+                [
+                    "El proyecto no expone una tabla 'Pipe' en Piping.dcf; "
+                    "las longitudes de tubería no están disponibles vía SQLite."
+                ]
+            )
+        pipe_cols = _table_columns(con, "Pipe")
+        if "Length" not in pipe_cols:
+            return _base_response(
+                [
+                    "La tabla 'Pipe' no tiene columna 'Length' en este proyecto; "
+                    "las longitudes de tubería no están disponibles vía SQLite."
+                ]
+            )
+
+        # LengthUnit es opcional: si falta, se selecciona NULL y se anota.
+        have_length_unit = "LengthUnit" in _table_columns(con, "EngineeringItems")
+        length_unit_expr = "ei.LengthUnit" if have_length_unit else "NULL"
+        if not have_length_unit:
+            notes.append(
+                "EngineeringItems no tiene columna 'LengthUnit' en este proyecto; "
+                "length_unit se devuelve como null (unidad no determinada)."
+            )
+
+        cur = con.cursor()
+        rows = cur.execute(
+            f"""
+            SELECT
+                prc.LineNumberTag   AS line,
+                ei.Spec             AS spec,
+                ei.NominalDiameter  AS dia,
+                ei.NominalUnit      AS dia_unit,
+                {length_unit_expr}  AS length_unit,
+                p.Length            AS length
+            FROM Pipe p
+            JOIN EngineeringItems ei  ON ei.PnPID  = p.PnPID
+            JOIN PipeRunComponent prc ON prc.PnPID = p.PnPID
+            """
+        ).fetchall()
+    finally:
+        con.close()
+
+    # --- aplicar filtros de alcance en Python (una sola pasada) ------------
+    apply_size = size_value is not None
+    filtered: list = []
+    for r in rows:
+        if line_norm is not None and _norm(r["line"]) != line_norm:
+            continue
+        if spec_norm is not None and _norm(r["spec"]) != spec_norm:
+            continue
+        if apply_size:
+            dia = r["dia"]
+            if dia is None:
+                continue
+            try:
+                if abs(float(dia) - float(size_value)) >= 1e-6:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if _norm(r["dia_unit"]) != _norm(size_unit):
+                continue
+        filtered.append(r)
+
+    # --- agregación pura ----------------------------------------------------
+    groups, totals_by_unit, total_count, untagged = _build_pipe_length_aggregates(
+        filtered, group_by
+    )
+
+    # --- construir grupos de salida (ordenados por longitud desc, valor asc) -
+    groups_out: list[dict] = []
+    for gkey, agg in groups.items():
+        length_out = _round_lengths(agg["lengths"])
+        # Para ordenar por longitud necesitamos un escalar: suma de todas las
+        # unidades del grupo (sólo relevante si hubiera unidades mezcladas).
+        sort_length = sum(agg["lengths"].values())
+        unit_out = (
+            next(iter(agg["lengths"].keys()))
+            if len(agg["lengths"]) == 1
+            else sorted(agg["lengths"].keys())
+        )
+        groups_out.append(
+            {
+                "group": gkey,
+                "pipe_count": agg["pipe_count"],
+                "length": length_out,
+                "length_unit": unit_out,
+                "_sort_length": sort_length,
+            }
+        )
+
+    groups_out.sort(key=lambda g: (-g["_sort_length"], str(g["group"])))
+    for g in groups_out:
+        del g["_sort_length"]
+
+    group_count = len(groups_out)
+    capped, omitted = _capped(groups_out, limit)
+
+    # --- unidad(es) de longitud a nivel global ------------------------------
+    units_present = sorted(totals_by_unit.keys())
+    if not units_present:
+        length_unit_out = None
+    elif len(units_present) == 1:
+        length_unit_out = units_present[0]
+    else:
+        length_unit_out = units_present
+        notes.append(
+            "Se han detectado varias unidades de longitud "
+            f"({', '.join(units_present)}); los totales se reportan por unidad "
+            "sin mezclarlas."
+        )
+
+    filters_echo = _filters_echo(line_norm, spec_norm, size_value, size_unit)
+
+    notes.append(
+        "Las longitudes provienen de la tabla 'Pipe' (solo tramos de tubería, "
+        "PartCategory='Pipe'); no incluyen dimensiones físicas de válvulas, "
+        "accesorios ni instrumentos."
+    )
+    notes.append(
+        "La unidad de longitud se lee de EngineeringItems.LengthUnit (no se "
+        "asume); es independiente de la unidad de diámetro (NominalUnit)."
+    )
+
+    return {
+        "ok": True,
+        "project": project_dir.name,
+        "path": str(project_dir),
+        "limit": limit,
+        "group_by": group_by,
+        "filters": filters_echo,
+        "length_unit": length_unit_out,
+        "total_pipe_count": total_count,
+        "total_length": _round_lengths(totals_by_unit) if totals_by_unit else 0,
+        "untagged": {
+            "pipe_count": untagged["pipe_count"],
+            "length": _round_lengths(untagged["lengths"]) if untagged["lengths"] else 0,
+        },
+        "group_count": group_count,
+        "omitted": omitted,
+        "groups": capped,
         "notes": notes,
     }

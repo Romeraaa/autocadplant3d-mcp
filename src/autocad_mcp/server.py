@@ -580,6 +580,14 @@ async def plant3d(
                        mismos filtros de alcance que list_components; aquí limit
                        acota el nº de líneas de BOM devueltas.
                        data: {project?, classes?, line?, spec?, size?, limit?}
+      pipe_length    — Suma longitudes reales de tramos de tubería (tabla Pipe,
+                       columna Length, solo PartCategory='Pipe'). Agrupa por
+                       group_by (line|spec|size; default line) y admite filtros
+                       por línea, spec y tamaño (diámetro; exige unidad). Reporta
+                       los tramos sin línea aparte (untagged) y la unidad leída
+                       de LengthUnit (no asumida). Aquí limit acota el nº de
+                       grupos devueltos.
+                       data: {project?, group_by?, line?, spec?, size?, limit?}
       list_projects  — Lista proyectos bajo una raíz. data: {root?}
                        (usa AUTOCAD_MCP_PLANT3D_ROOT si no se indica root)
     """
@@ -615,6 +623,9 @@ async def plant3d(
     elif operation == "bom":
         project = data.get("project") or await _detect_open_project()
         result = plant3d_query.bom(project, data)
+    elif operation == "pipe_length":
+        project = data.get("project") or await _detect_open_project()
+        result = plant3d_query.pipe_length(project, data)
     else:
         return _json({"error": f"Unknown plant3d operation: {operation}"})
 

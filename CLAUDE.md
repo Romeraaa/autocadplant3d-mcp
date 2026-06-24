@@ -129,7 +129,7 @@ Modificar: `copy` · `move` · `rotate` · `scale` · `mirror` · `offset` · `a
 ⚠️ `execute_lisp` está documentado pero NO debe usarse (ver regla 1).
 
 ### `plant3d` — Consulta de proyectos Plant 3D (solo lectura)
-`detect_project` · `line_summary` · `list_projects` · `find_untagged` · `validate_specs` · `list_lines` · `list_components` · `list_valves` · `list_instruments` · `bom`
+`detect_project` · `line_summary` · `list_projects` · `find_untagged` · `validate_specs` · `list_lines` · `list_components` · `list_valves` · `list_instruments` · `bom` · `pipe_length`
 Lee directamente las bases SQLite (`.dcf`) del proyecto — **no requiere el plugin .NET**
 y nunca modifica el proyecto (apertura `mode=ro`).
 - `find_untagged` — lista los componentes de tubería SIN número de línea válido
@@ -184,6 +184,24 @@ y nunca modifica el proyecto (apertura `mode=ro`).
   filters, total_components, line_count, omitted, by_class, bom, notes}`; cada línea de BOM:
   `{class, spec, size, description, quantity}`. No aplica la limitación de localización en el
   dibujo (un BOM no localiza objetos).
+- `pipe_length` — genera el sumatorio de longitudes reales de tubería del proyecto. Solo
+  lectura; consulta directamente la tabla **`Pipe`** de `Piping.dcf` (columna `Length`), casada
+  por `PnPID` con `EngineeringItems` y `PipeRunComponent`. Solo aplica a
+  `PartCategory='Pipe'` — no acumula dimensiones físicas de válvulas, fittings ni
+  instrumentos. La unidad de longitud se lee de `EngineeringItems.LengthUnit` (típicamente
+  `'mm'`), nunca se asume; es ortogonal a `NominalUnit` (diámetro). No mezcla longitudes de
+  distinta unidad. Parámetro `group_by` (`"line"` por defecto | `"spec"` | `"size"`) y
+  filtros de alcance idénticos a `list_components`: `line`, `spec`, `size` (`{"value","unit"}`
+  — exige unidad), `limit` (default 50, 0 = sin tope; acota número de GRUPOS, reporta
+  `omitted` sin truncado silencioso). Tramos sin línea válida (`LineNumberTag`
+  NULL/`''`/`'?'`) se reportan SIEMPRE en el campo `untagged` `{pipe_count, length}` y
+  además como grupo `"(SIN LÍNEA)"` cuando `group_by="line"`. Salida: `{ok, project, path,
+  limit, group_by, filters, length_unit, total_pipe_count, total_length, untagged,
+  group_count, omitted, groups, notes}`; cada grupo: `{group, pipe_count, length,
+  length_unit}`. Longitudes redondeadas a 2 decimales. Robusto a variaciones de esquema
+  (PRAGMA): degrada con gracia (ok:True, groups vacíos, totales 0, nota) si falta la tabla
+  `Pipe`, la columna `Length` o `LengthUnit`. **No localiza el objeto en el dibujo** (sin
+  handle/GUID en SQLite — requeriría plugin .NET).
 **Por defecto consulta el proyecto que el usuario tiene abierto en AutoCAD:** si no se pasa
 `project`, lee `DWGPREFIX` del dibujo activo (vía backend File IPC) y sube hasta el `Project.xml`.
 También admite `project` explícito (ruta a la carpeta o, con `AUTOCAD_MCP_PLANT3D_ROOT`, el nombre).
@@ -253,7 +271,12 @@ del plugin .NET ni de AutoCAD abierto: se lee el SQLite con el módulo `sqlite3`
   y testeada 2026-06-23, 52 tests nuevos, suite total 454 verdes; commit pendiente). ·
   `plant3d.list_instruments` (preset de `list_components` con `classes=["instrument"]` fijado;
   implementada y testeada 2026-06-23, 52 tests nuevos, suite total 506 verdes; commit pendiente). ·
-  `plant3d.bom` (Bill of Materials — agregación de `list_components` por la tupla clase/spec/tamaño/descripción con `quantity` por recuento; implementada y testeada 2026-06-23, 72 tests nuevos, suite total 578 verdes; apta para commit).
+  `plant3d.bom` (Bill of Materials — agregación de `list_components` por la tupla clase/spec/tamaño/descripción con `quantity` por recuento; implementada y testeada 2026-06-23, 72 tests nuevos, suite total 578 verdes; apta para commit). ·
+  `plant3d.pipe_length` (sumatorio de longitudes reales de tubería — tabla `Pipe`, columna `Length`,
+  unidad desde `LengthUnit`; group_by line/spec/size; tramos sin línea en campo `untagged` y grupo
+  `"(SIN LÍNEA)"`; implementada y testeada 2026-06-24, 101 tests nuevos, suite total 679 verdes,
+  test de integración real incluido; validado: AIR LIQUIDE HUELVA = 1679 tramos ≈ 1.635.082 mm,
+  con línea válida 1300 tramos ≈ 1.333.000 mm, untagged 379 tramos ≈ 302.000 mm; commit pendiente).
   Detección del proyecto abierto: lee `DWGPREFIX` del dibujo activo y sube hasta `Project.xml`.
 - Las herramientas de solo lectura del trío original ya están implementadas vía SQLite.
   **Fase actual: SOLO CONSULTA (decisión 2026-06-22).** La escritura y el plugin .NET quedan aplazados; ver sección siguiente.
