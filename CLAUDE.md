@@ -129,7 +129,7 @@ Modificar: `copy` · `move` · `rotate` · `scale` · `mirror` · `offset` · `a
 ⚠️ `execute_lisp` está documentado pero NO debe usarse (ver regla 1).
 
 ### `plant3d` — Consulta de proyectos Plant 3D (solo lectura)
-`detect_project` · `line_summary` · `list_projects` · `find_untagged` · `validate_specs` · `list_lines` · `list_components` · `list_valves` · `list_instruments` · `bom` · `pipe_length` · `weld_list`
+`detect_project` · `line_summary` · `list_projects` · `find_untagged` · `validate_specs` · `list_lines` · `list_components` · `list_valves` · `list_instruments` · `bom` · `pipe_length` · `weld_list` · `bolt_gasket_list`
 Lee directamente las bases SQLite (`.dcf`) del proyecto — **no requiere el plugin .NET**
 y nunca modifica el proyecto (apertura `mode=ro`).
 - `find_untagged` — lista los componentes de tubería SIN número de línea válido
@@ -221,6 +221,28 @@ y nunca modifica el proyecto (apertura `mode=ro`).
   esquema (PRAGMA): degrada con gracia (ok:True, total 0, listas vacías, nota) si faltan
   las tres tablas, la columna `Shop_Field` o las tablas/columnas de relación de línea.
   **No localiza el objeto en el dibujo** (sin handle/GUID en SQLite — requeriría plugin .NET).
+- `bolt_gasket_list` — lista y recuento de pernos y juntas (material de montaje de bridas) del
+  proyecto. Solo lectura; consulta DOS tablas dedicadas de `Piping.dcf`: **`BoltSet`** (conjuntos
+  de pernos; columnas `BoltSize`, `NumberInSet`, `BoltCompatibleStd`, `Shop_Field`) y **`Gasket`**
+  (juntas). IGNORA `Fasteners` (superconjunto genérico no fiable). Cada elemento se casa por
+  `PnPID` con `EngineeringItems` (Spec, NominalDiameter/NominalUnit — diámetro de brida en in/mm
+  sin colapsar, Material); la línea se resuelve vía `P3dLineGroupPartRelationship` →
+  `P3dLineGroup.Tag` (1:1; ~80% de cobertura; el ~20% sin línea es legítimo — bridas en cabeza de
+  ramal sin asignación de línea). Doble métrica de cantidad: `item_count` (filas: sets + juntas),
+  `bolt_sets`, `individual_bolts` (Σ `NumberInSet`, parseado de texto y expuesto como int;
+  `NumberInSet` no numérico → contribuye 0 con nota), `gaskets` (cada junta = 1). Parámetros
+  (`data`): `group_by` (`"line"` por defecto | `"size"` | `"spec"` | `"material"` |
+  `"item_type"` | `"shop_field"` | `"bolt_size"`); filtros `item_type` (`"bolt"` | `"gasket"`),
+  `line`, `spec`, `size` (`{"value","unit"}` — exige unidad), `shop_field` (`"shop"` | `"field"`);
+  `limit` (default 50, 0 = sin tope; acota el número de GRUPOS, reporta `omitted`). Salida:
+  `{ok, project, path, limit, group_by, filters, totals{item_count, bolt_sets, individual_bolts,
+  gaskets}, by_item_type[], by_shop_field[], untagged{...}, group_count, omitted, groups[],
+  notes}`. `by_item_type` y `by_shop_field` son desgloses globales siempre presentes. Items sin
+  línea válida se reportan en `untagged` y, cuando `group_by="line"`, también como grupo
+  `"(SIN LÍNEA)"`. Robusto a variaciones de esquema (PRAGMA): degrada con gracia (ok:True,
+  totales 0, listas vacías, nota) si faltan las tablas, columnas opcionales (`NumberInSet` /
+  `BoltSize` / `Shop_Field`) o las tablas/columnas de relación de línea. **No localiza el objeto
+  en el dibujo** (sin handle/GUID en SQLite — requeriría plugin .NET).
 **Por defecto consulta el proyecto que el usuario tiene abierto en AutoCAD:** si no se pasa
 `project`, lee `DWGPREFIX` del dibujo activo (vía backend File IPC) y sube hasta el `Project.xml`.
 También admite `project` explícito (ruta a la carpeta o, con `AUTOCAD_MCP_PLANT3D_ROOT`, el nombre).
@@ -303,7 +325,17 @@ del plugin .NET ni de AutoCAD abierto: se lee el SQLite con el módulo `sqlite3`
   línea en `untagged` y grupo `"(SIN LÍNEA)"`; implementada, testeada y revisada 2026-06-24,
   162 tests nuevos, suite total 841 verdes, test de integración real incluido; validado:
   AIR LIQUIDE HUELVA = 2953 soldaduras — Buttweld 2382 / Socketweld 365 / TapWeld 206, ~97%
-  con línea válida; commit pendiente).
+  con línea válida; commit pendiente). ·
+  `plant3d.bolt_gasket_list` (lista y recuento de pernos y juntas — tablas `BoltSet` y `Gasket`
+  en `Piping.dcf`; IGNORA `Fasteners`; cada elemento casado por `PnPID` con `EngineeringItems`
+  (Spec, NominalDiameter/NominalUnit); línea vía `P3dLineGroupPartRelationship` → `P3dLineGroup.Tag`
+  (~80% cobertura; ~20% sin línea legítimo); doble métrica `item_count`/`bolt_sets`/
+  `individual_bolts`/`gaskets` (`NumberInSet` parseado de texto); group_by
+  line/size/spec/material/item_type/shop_field/bolt_size; filtros item_type/line/spec/size/
+  shop_field; items sin línea en `untagged` y grupo `"(SIN LÍNEA)"`; implementada, testeada y
+  revisada 2026-06-24, 223 tests nuevos, suite total 1064 verdes, test de integración real
+  incluido; validado: AIR LIQUIDE HUELVA = bolt_sets 248 / individual_bolts 1952 / gaskets 262 /
+  item_count 510; commit pendiente).
   Detección del proyecto abierto: lee `DWGPREFIX` del dibujo activo y sube hasta `Project.xml`.
 - Las herramientas de solo lectura del trío original ya están implementadas vía SQLite.
   **Fase actual: SOLO CONSULTA (decisión 2026-06-22).** La escritura y el plugin .NET quedan aplazados; ver sección siguiente.

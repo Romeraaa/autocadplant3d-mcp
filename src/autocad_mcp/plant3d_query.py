@@ -2283,3 +2283,592 @@ def weld_list(project: str, data: dict | None = None) -> dict:
         "groups": capped,
         "notes": notes,
     }
+
+
+# ---------------------------------------------------------------------------
+# Bolt & gasket list (flange make-up material count / breakdown)
+# ---------------------------------------------------------------------------
+
+# Tablas dedicadas de material de montaje de bridas en Piping.dcf, una fila por
+# item. La clave del mapa es la etiqueta de item_type expuesta en la salida; el
+# valor es el nombre real de la tabla SQLite. NO se usa la tabla 'Fasteners'
+# (superconjunto genérico que mezcla soldaduras, roscas, juntas y pernos).
+_BG_TABLES = {
+    "bolt": "BoltSet",
+    "gasket": "Gasket",
+}
+
+# Tipos de item válidos para el filtro item_type (las claves de _BG_TABLES).
+_BG_ITEM_TYPES = tuple(_BG_TABLES.keys())
+
+# Claves canónicas de agrupación admitidas por bolt_gasket_list.
+_BG_GROUP_BY = ("line", "size", "spec", "material", "item_type", "shop_field", "bolt_size")
+
+
+def _bg_empty_metrics() -> dict:
+    """Return a fresh, zeroed bolt/gasket metrics block.
+
+    The bolt/gasket count is multi-metric (bolts and gaskets carry a different
+    quantity semantics), so every aggregation bucket — ``totals``, each group
+    and ``untagged`` — shares this shape:
+
+    * ``item_count`` — number of rows (bolt sets + gaskets).
+    * ``bolt_sets`` — number of ``BoltSet`` rows.
+    * ``individual_bolts`` — Σ ``NumberInSet`` over the bolt sets.
+    * ``gaskets`` — number of ``Gasket`` rows.
+    """
+    return {
+        "item_count": 0,
+        "bolt_sets": 0,
+        "individual_bolts": 0,
+        "gaskets": 0,
+    }
+
+
+def _bg_accumulate(metrics: dict, row: dict) -> None:
+    """Add one bolt/gasket ``row`` to a metrics block (in place).
+
+    ``row`` must expose ``item_type`` (``"bolt"``/``"gasket"``) and, for bolts,
+    ``num_in_set`` (already parsed to a float count; gaskets count as 1 each).
+    """
+    metrics["item_count"] += 1
+    if row["item_type"] == "bolt":
+        metrics["bolt_sets"] += 1
+        metrics["individual_bolts"] += row["num_in_set"]
+    else:  # "gasket"
+        metrics["gaskets"] += 1
+
+
+def _build_bolt_gasket_aggregates(
+    rows: list, group_by: str
+) -> tuple[dict, dict, dict, dict, dict]:
+    """Aggregate raw bolt/gasket rows into per-group metrics. Pure (no I/O).
+
+    ``rows`` must expose ``item_type`` (``"bolt"``/``"gasket"``), ``num_in_set``
+    (bolts: parsed ``NumberInSet`` count; gaskets: 0), ``shop_field`` (already
+    normalized via :func:`_norm_shop_field`), ``line`` (resolved raw line Tag or
+    None), ``spec``, ``material`` (sanitized None/empty -> None), ``dia`` and
+    ``dia_unit`` (the flange nominal diameter from ``EngineeringItems``) and
+    ``bolt_size`` (bolts only; the bolt diameter, e.g. ``5/8"``/``M16``).
+
+    The grouping key depends on ``group_by``:
+
+    * ``"line"`` — the raw resolved line Tag; items with a blank/placeholder or
+      absent Tag (``_is_blank_tag``) are grouped under :data:`_NO_LINE_LABEL`.
+    * ``"size"`` — the flange nominal diameter formatted with :func:`_fmt_size`,
+      kept separate per unit (inches vs millimetres never merged).
+    * ``"spec"`` — the ``EngineeringItems.Spec`` (None/empty -> ``"(sin spec)"``).
+    * ``"material"`` — the ``EngineeringItems.Material`` (None -> ``"(sin)"``).
+    * ``"item_type"`` — bolt/gasket.
+    * ``"shop_field"`` — the normalized Shop_Field (shop/field/unknown).
+    * ``"bolt_size"`` — the bolt diameter (gaskets have no bolt size -> ``"(sin)"``;
+      meaningful chiefly alongside ``item_type="bolt"``).
+
+    Returns ``(groups, by_item_type, by_shop_field, totals, untagged)`` where
+    ``groups`` maps ``group_value -> metrics block`` and the rest are metrics
+    blocks (``by_item_type``/``by_shop_field`` keyed by their breakdown value).
+    """
+    groups: dict[str, dict] = {}
+    by_item_type: dict[str, dict] = {}
+    by_shop_field: dict[str, dict] = {}
+    totals = _bg_empty_metrics()
+    untagged = _bg_empty_metrics()
+
+    for r in rows:
+        _bg_accumulate(totals, r)
+
+        itype = r["item_type"]
+        _bg_accumulate(by_item_type.setdefault(itype, _bg_empty_metrics()), r)
+
+        sf = r["shop_field"]
+        _bg_accumulate(by_shop_field.setdefault(sf, _bg_empty_metrics()), r)
+
+        # Los items sin línea válida se reportan SIEMPRE en 'untagged'.
+        is_untagged = _is_blank_tag(r["line"])
+        if is_untagged:
+            _bg_accumulate(untagged, r)
+
+        # --- clave de agrupación según group_by ----------------------------
+        if group_by == "size":
+            gkey = (
+                _fmt_size(r["dia"], r["dia_unit"]) if r["dia"] is not None else "?"
+            )
+        elif group_by == "spec":
+            spec = r["spec"]
+            gkey = str(spec).strip() if spec and str(spec).strip() else "(sin spec)"
+        elif group_by == "material":
+            mat = r["material"]
+            gkey = str(mat).strip() if mat and str(mat).strip() else "(sin)"
+        elif group_by == "item_type":
+            gkey = itype
+        elif group_by == "shop_field":
+            gkey = sf
+        elif group_by == "bolt_size":
+            bs = r["bolt_size"]
+            gkey = str(bs).strip() if bs and str(bs).strip() else "(sin)"
+        else:  # "line"
+            gkey = _NO_LINE_LABEL if is_untagged else str(r["line"]).strip()
+
+        _bg_accumulate(groups.setdefault(gkey, _bg_empty_metrics()), r)
+
+    return groups, by_item_type, by_shop_field, totals, untagged
+
+
+def bolt_gasket_list(project: str, data: dict | None = None) -> dict:
+    """Count and break down the bolts and gaskets of a Plant 3D project.
+
+    Bolts and gaskets (flange make-up material) live in two dedicated tables in
+    ``Piping.dcf`` — ``BoltSet`` (one row per bolt set) and ``Gasket`` (one row
+    per gasket) — each carrying ``PnPID`` and ``Shop_Field``. The generic
+    ``Fasteners`` table is **not** used (it is a superset mixing welds, threaded
+    joints, gaskets and bolts). Each item joins 1:1 to ``EngineeringItems`` by
+    ``PnPID`` for its spec, flange nominal diameter (``NominalDiameter`` +
+    ``NominalUnit``), ``Material`` (sanitized to None) and, when present,
+    ``PressureClass``/``Facing``. Its line is resolved via
+    ``P3dLineGroupPartRelationship`` → ``P3dLineGroup.Tag`` (item.PnPID =
+    relationship.Part ; relationship.LineGroup = P3dLineGroup.PnPID).
+
+    Quantity is multi-metric: ``BoltSet.NumberInSet`` (TEXT, mixed formats —
+    parsed with ``float``; non-numeric values contribute 0 with a note) is the
+    number of bolts per set, while each ``Gasket`` row is one gasket. Every
+    aggregation bucket reports ``item_count`` (rows), ``bolt_sets``,
+    ``individual_bolts`` (Σ ``NumberInSet``) and ``gaskets``.
+
+    ``data`` accepts:
+
+    * ``group_by`` — ``"line"`` (default) | ``"size"`` | ``"spec"`` |
+      ``"material"`` | ``"item_type"`` | ``"shop_field"`` | ``"bolt_size"``: the
+      key the returned groups are aggregated by. For ``"line"``, items without a
+      valid resolved line Tag are grouped under ``"(SIN LÍNEA)"``; for the others
+      they fall into their natural group. ``"bolt_size"`` only applies to bolts
+      (gaskets fall into ``"(sin)"``). An unrecognized value falls back to
+      ``"line"`` with a note.
+    * ``item_type`` — ``"bolt"`` | ``"gasket"`` (omitted = both): chooses which
+      table(s) to read.
+    * ``line`` — keep only items whose resolved line Tag matches (``_norm``,
+      exact).
+    * ``spec`` — keep only items whose ``EngineeringItems.Spec`` matches
+      (``_norm``, exact).
+    * ``size`` — keep only a given flange nominal **diameter**; requires a unit
+      (``{"value": <num>, "unit": "in"|"mm"}``); without a usable unit the filter
+      is skipped and a note is added.
+    * ``shop_field`` — ``"shop"`` | ``"field"`` (normalized): keep only items of
+      that fabrication kind.
+    * ``limit`` — max GROUPS returned (default 50, 0 = no cap). Omitted groups
+      are reported via ``omitted``, never truncated silently.
+
+    ``by_item_type`` and ``by_shop_field`` are global breakdowns (over the
+    filtered scope) always present, independent of ``group_by``. Items without a
+    valid line are always reported in a top-level ``untagged`` field. The
+    caller's ``data`` dict is never mutated.
+
+    Schema robustness: each table and its columns are probed with ``PRAGMA
+    table_info`` before querying. If NEITHER ``BoltSet`` nor ``Gasket`` exists
+    the tool degrades gracefully (``ok: True``, zero totals, empty lists,
+    explanatory note); if only one exists it is used with a note. Optional
+    columns (``NumberInSet``, ``BoltCompatibleStd``, ``Facing``,
+    ``PressureClass``) degrade to None/0 with a note when absent. If the
+    line-resolution tables/columns are missing, every item degrades to
+    untagged/``"(SIN LÍNEA)"`` plus a note instead of raising.
+    """
+    data = data or {}
+    project_dir = resolve_project_dir(project)
+    db = _db_path(project_dir, "Piping.dcf")
+
+    # --- group_by (validado; default "line") -------------------------------
+    group_by = str(data.get("group_by") or "line").strip().lower()
+    notes: list[str] = []
+    if group_by not in _BG_GROUP_BY:
+        notes.append(
+            f"group_by '{group_by}' no reconocido; se usa 'line' "
+            "(válidos: line, size, spec, material, item_type, shop_field, "
+            "bolt_size)."
+        )
+        group_by = "line"
+
+    limit = data.get("limit", _DEFAULT_LIMIT)
+
+    # --- filtros de alcance (misma semántica que weld_list) ----------------
+    line_filter = data.get("line")
+    line_norm = _norm(line_filter) if line_filter else None
+    spec_filter = data.get("spec")
+    spec_norm = _norm(spec_filter) if spec_filter else None
+
+    # shop_field: "shop" | "field" (normalizado). Valor no reconocido se ignora.
+    shop_field_raw = data.get("shop_field")
+    shop_field_norm: str | None = None
+    if shop_field_raw is not None and str(shop_field_raw).strip():
+        sf = _norm_shop_field(shop_field_raw)
+        if sf in ("shop", "field"):
+            shop_field_norm = sf
+        else:
+            notes.append(
+                f"Filtro 'shop_field' '{shop_field_raw}' no reconocido "
+                "(válidos: shop, field); se ignora."
+            )
+
+    # item_type: "bolt" | "gasket". Valor no reconocido se ignora (= ambos).
+    item_type_raw = data.get("item_type")
+    item_type_norm: str | None = None
+    if item_type_raw is not None and str(item_type_raw).strip():
+        it = str(item_type_raw).strip().lower()
+        if it in _BG_ITEM_TYPES:
+            item_type_norm = it
+        else:
+            notes.append(
+                f"Filtro 'item_type' '{item_type_raw}' no reconocido "
+                "(válidos: bolt, gasket); se ignora."
+            )
+
+    # size: filtra por DIÁMETRO de brida y exige unidad (no se adivina in/mm).
+    size_raw = data.get("size")
+    size_value: float | None = None
+    size_unit: str | None = None
+    if size_raw is not None:
+        if isinstance(size_raw, dict):
+            size_value = size_raw.get("value")
+            size_unit = size_raw.get("unit")
+        else:
+            size_value = size_raw
+        if size_value is None or not (size_unit and str(size_unit).strip()):
+            notes.append(
+                "Filtro 'size' ignorado: requiere unidad explícita "
+                '({"value": <num>, "unit": "in"|"mm"}) para no mezclar in/mm. '
+                "Filtra el diámetro nominal de la brida."
+            )
+            size_value = None
+            size_unit = None
+
+    def _filters_echo_bg() -> dict:
+        """Echo de los filtros aplicados (estilo weld_list)."""
+        echo: dict = {}
+        if line_norm is not None:
+            echo["line"] = line_norm
+        if spec_norm is not None:
+            echo["spec"] = spec_norm
+        if size_value is not None:
+            echo["size"] = {"value": size_value, "unit": _norm(size_unit)}
+        if shop_field_norm is not None:
+            echo["shop_field"] = shop_field_norm
+        if item_type_norm is not None:
+            echo["item_type"] = item_type_norm
+        return echo
+
+    def _base_response(extra_notes: list[str]) -> dict:
+        """Respuesta degradada (ok) cuando no hay items que contar."""
+        return {
+            "ok": True,
+            "project": project_dir.name,
+            "path": str(project_dir),
+            "limit": limit,
+            "group_by": group_by,
+            "filters": _filters_echo_bg(),
+            "totals": _bg_empty_metrics(),
+            "by_item_type": [],
+            "by_shop_field": [],
+            "untagged": _bg_empty_metrics(),
+            "group_count": 0,
+            "omitted": 0,
+            "groups": [],
+            "notes": notes + extra_notes,
+        }
+
+    con = _connect_ro(db)
+    try:
+        # --- robustez de esquema: qué tablas existen y con qué columnas -----
+        # PnPID es imprescindible para el cruce; si falta, la tabla se omite.
+        # Columnas opcionales (NumberInSet, BoltCompatibleStd, Facing,
+        # PressureClass, Material) se sondean por PRAGMA y degradan a None/0.
+        present: dict[str, dict] = {}  # item_type -> info de columnas
+        absent_types: list[str] = []
+        no_num_in_set: list[str] = []
+        no_sf: list[str] = []
+        for itype, table in _BG_TABLES.items():
+            if item_type_norm is not None and itype != item_type_norm:
+                # Si se filtró por un item_type concreto, ignoramos el otro.
+                continue
+            if not _table_exists(con, table):
+                absent_types.append(itype)
+                continue
+            cols = _table_columns(con, table)
+            if "PnPID" not in cols:
+                absent_types.append(itype)
+                continue
+            have_num = "NumberInSet" in cols
+            if itype == "bolt" and not have_num:
+                no_num_in_set.append(table)
+            have_sf = "Shop_Field" in cols
+            if not have_sf:
+                no_sf.append(table)
+            present[itype] = {
+                "table": table,
+                "have_num_in_set": have_num,
+                "have_shop_field": have_sf,
+                "have_bolt_size": "BoltSize" in cols,
+            }
+
+        if not present:
+            # Ninguna tabla de montaje de bridas utilizable.
+            if item_type_norm is not None:
+                msg = (
+                    f"El proyecto no expone la tabla '{_BG_TABLES[item_type_norm]}' "
+                    f"(item_type '{item_type_norm}') en Piping.dcf."
+                )
+            else:
+                msg = (
+                    "El proyecto no expone las tablas BoltSet/Gasket en "
+                    "Piping.dcf; los pernos y juntas no están disponibles vía "
+                    "SQLite."
+                )
+            return _base_response([msg])
+
+        if absent_types and item_type_norm is None:
+            faltan = ", ".join(_BG_TABLES[t] for t in absent_types)
+            notes.append(f"Tablas de montaje de bridas ausentes (omitidas): {faltan}.")
+        if no_num_in_set:
+            notes.append(
+                "Sin columna 'NumberInSet' en: "
+                + ", ".join(no_num_in_set)
+                + "; individual_bolts no puede calcularse para esas filas (0)."
+            )
+        if no_sf:
+            notes.append(
+                "Sin columna 'Shop_Field' en: "
+                + ", ".join(no_sf)
+                + f"; esos items se cuentan como '{_UNKNOWN_SHOP_FIELD}'."
+            )
+
+        # --- mapa PnPID de item -> Tag de línea -----------------------------
+        # Resuelto vía P3dLineGroupPartRelationship (Part = PnPID del componente,
+        # LineGroup = PnPID de la cabecera) ⨝ P3dLineGroup (Tag). Degradamos a
+        # mapa vacío (todos untagged) si faltan tablas o columnas.
+        line_by_pnpid: dict[str, str] = {}
+        have_rel = _table_exists(
+            con, "P3dLineGroupPartRelationship"
+        ) and _table_exists(con, "P3dLineGroup")
+        if have_rel:
+            rel_cols = _table_columns(con, "P3dLineGroupPartRelationship")
+            lg_cols = _table_columns(con, "P3dLineGroup")
+            missing_rel = [c for c in ("Part", "LineGroup") if c not in rel_cols]
+            missing_lg = [c for c in ("PnPID", "Tag") if c not in lg_cols]
+            if missing_rel or missing_lg:
+                have_rel = False
+                faltan = ", ".join(
+                    [f"P3dLineGroupPartRelationship.{c}" for c in missing_rel]
+                    + [f"P3dLineGroup.{c}" for c in missing_lg]
+                )
+                notes.append(
+                    "Columnas ausentes para resolver la línea de pernos/juntas "
+                    f"({faltan}): todos se reportan sin línea."
+                )
+        else:
+            notes.append(
+                "Sin tablas de relación línea-componente "
+                "(P3dLineGroupPartRelationship / P3dLineGroup): los pernos y "
+                "juntas se reportan sin línea."
+            )
+        if have_rel:
+            try:
+                rel_rows = con.execute(
+                    """
+                    SELECT rel.Part AS part, lg.Tag AS tag
+                    FROM P3dLineGroupPartRelationship rel
+                    JOIN P3dLineGroup lg ON lg.PnPID = rel.LineGroup
+                    """
+                ).fetchall()
+            except sqlite3.Error:
+                rel_rows = []
+                notes.append(
+                    "No se pudo resolver la línea de pernos/juntas "
+                    "(incompatibilidad de esquema): se reportan sin línea."
+                )
+            for r in rel_rows:
+                part = r["part"]
+                tag = r["tag"]
+                if part is None:
+                    continue
+                if tag is not None and str(tag).strip():
+                    # Un PnPID se asocia a una sola línea; el primero gana.
+                    line_by_pnpid.setdefault(str(part), str(tag).strip())
+
+        # --- SELECT plano por cada tabla presente ---------------------------
+        # Casamos 1:1 con EngineeringItems por PnPID (spec + diámetro de brida +
+        # material). La línea se resuelve en Python con line_by_pnpid (no en SQL),
+        # igual que el resto del módulo agrega tras leer.
+        raw_rows: list[dict] = []
+        bad_num_in_set = 0  # nº de NumberInSet no numéricos (contribuyen 0)
+        cur = con.cursor()
+        for itype, info in present.items():
+            sf_expr = "x.Shop_Field" if info["have_shop_field"] else "NULL"
+            if itype == "bolt":
+                num_expr = "x.NumberInSet" if info["have_num_in_set"] else "NULL"
+                bsize_expr = "x.BoltSize" if info["have_bolt_size"] else "NULL"
+            else:
+                num_expr = "NULL"
+                bsize_expr = "NULL"
+            irows = cur.execute(
+                f"""
+                SELECT
+                    x.PnPID            AS pnpid,
+                    {sf_expr}          AS shop_field,
+                    {num_expr}         AS num_in_set,
+                    {bsize_expr}       AS bolt_size,
+                    ei.Spec            AS spec,
+                    ei.Material        AS material,
+                    ei.NominalDiameter AS dia,
+                    ei.NominalUnit     AS dia_unit
+                FROM "{info['table']}" x
+                LEFT JOIN EngineeringItems ei ON ei.PnPID = x.PnPID
+                """
+            ).fetchall()
+            for r in irows:
+                pnpid = r["pnpid"]
+                # NumberInSet es TEXTO con formatos mezclados ('4', '4.0', ...).
+                # float() lo parsea; valores no numéricos -> 0 (no se lanza).
+                num_in_set = 0.0
+                if itype == "bolt":
+                    raw_num = r["num_in_set"]
+                    if raw_num is not None:
+                        try:
+                            num_in_set = float(raw_num)
+                        except (TypeError, ValueError):
+                            bad_num_in_set += 1
+                # Material puede ser None o '' -> se sanea a None.
+                mat = r["material"]
+                material = (
+                    str(mat) if mat is not None and str(mat).strip() else None
+                )
+                raw_rows.append(
+                    {
+                        "item_type": itype,
+                        "shop_field": _norm_shop_field(r["shop_field"]),
+                        "num_in_set": num_in_set,
+                        "bolt_size": r["bolt_size"],
+                        "spec": r["spec"],
+                        "material": material,
+                        "dia": r["dia"],
+                        "dia_unit": r["dia_unit"],
+                        # Línea resuelta (raw Tag) o None si no hay relación.
+                        "line": line_by_pnpid.get(str(pnpid))
+                        if pnpid is not None
+                        else None,
+                    }
+                )
+    finally:
+        con.close()
+
+    if bad_num_in_set:
+        notes.append(
+            f"NumberInSet con {bad_num_in_set} valor(es) no numérico(s): "
+            "contribuyen 0 a individual_bolts."
+        )
+
+    # --- aplicar filtros de alcance en Python (una sola pasada) ------------
+    # item_type ya se acotó al elegir las tablas presentes.
+    apply_size = size_value is not None
+    filtered: list[dict] = []
+    for r in raw_rows:
+        if line_norm is not None and _norm(r["line"]) != line_norm:
+            continue
+        if spec_norm is not None and _norm(r["spec"]) != spec_norm:
+            continue
+        if shop_field_norm is not None and r["shop_field"] != shop_field_norm:
+            continue
+        if apply_size:
+            dia = r["dia"]
+            if dia is None:
+                continue
+            try:
+                if abs(float(dia) - float(size_value)) >= 1e-6:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if _norm(r["dia_unit"]) != _norm(size_unit):
+                continue
+        filtered.append(r)
+
+    # --- agregación pura ----------------------------------------------------
+    (
+        groups,
+        by_item_type,
+        by_shop_field,
+        totals,
+        untagged,
+    ) = _build_bolt_gasket_aggregates(filtered, group_by)
+
+    # individual_bolts es una suma de floats; lo exponemos como int (los conteos
+    # de pernos son enteros, aunque NumberInSet venga como '4.0').
+    def _expose(m: dict) -> dict:
+        return {
+            "item_count": m["item_count"],
+            "bolt_sets": m["bolt_sets"],
+            "individual_bolts": int(round(m["individual_bolts"])),
+            "gaskets": m["gaskets"],
+        }
+
+    # --- grupos de salida (ordenados por item_count desc, valor asc) --------
+    groups_out = [
+        {"group": gkey, **_expose(m)}
+        for gkey, m in sorted(
+            groups.items(), key=lambda kv: (-kv[1]["item_count"], str(kv[0]))
+        )
+    ]
+    group_count = len(groups_out)
+    capped, omitted = _capped(groups_out, limit)
+
+    # --- desgloses globales (siempre presentes), ranked desc ----------------
+    by_item_type_ranked = [
+        {
+            "item_type": name,
+            "item_count": m["item_count"],
+            "individual_bolts": int(round(m["individual_bolts"])),
+        }
+        for name, m in sorted(
+            by_item_type.items(), key=lambda kv: (-kv[1]["item_count"], kv[0])
+        )
+    ]
+    by_shop_field_ranked = [
+        {"shop_field": name, "item_count": m["item_count"]}
+        for name, m in sorted(
+            by_shop_field.items(), key=lambda kv: (-kv[1]["item_count"], kv[0])
+        )
+    ]
+
+    notes.append(
+        "Origen: tablas BoltSet/Gasket de Piping.dcf (NO la tabla genérica "
+        "Fasteners). El item_type se deriva de la tabla de origen."
+    )
+    notes.append(
+        "individual_bolts proviene de BoltSet.NumberInSet (TEXTO parseado); "
+        "cada Gasket cuenta como 1 junta (sin cantidad propia)."
+    )
+    notes.append(
+        "NominalDiameter es el diámetro de la BRIDA; BoltSize es el diámetro del "
+        "perno (solo en pernos)."
+    )
+    notes.append(
+        "Cobertura de línea parcial: un % de pernos/juntas puede no tener línea "
+        "válida resuelta (~20% en proyectos reales; van a 'untagged'), coherente "
+        "con find_untagged."
+    )
+    notes.append(
+        "No localiza el objeto en el dibujo (sin handle/GUID en SQLite; "
+        "requeriría el plugin .NET)."
+    )
+
+    return {
+        "ok": True,
+        "project": project_dir.name,
+        "path": str(project_dir),
+        "limit": limit,
+        "group_by": group_by,
+        "filters": _filters_echo_bg(),
+        "totals": _expose(totals),
+        "by_item_type": by_item_type_ranked,
+        "by_shop_field": by_shop_field_ranked,
+        "untagged": _expose(untagged),
+        "group_count": group_count,
+        "omitted": omitted,
+        "groups": capped,
+        "notes": notes,
+    }

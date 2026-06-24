@@ -600,6 +600,19 @@ async def plant3d(
                        desglosa, no numera. Aquí limit acota el nº de grupos.
                        data: {project?, group_by?, line?, spec?, size?,
                        shop_field?, weld_type?, limit?}
+      bolt_gasket_list — Recuento y desglose de pernos y juntas (material de
+                       montaje de bridas; tablas BoltSet/Gasket, NO Fasteners).
+                       Métricas multi-valor por bucket: item_count, bolt_sets,
+                       individual_bolts (Σ NumberInSet) y gaskets. Agrupa por
+                       group_by (line|size|spec|material|item_type|shop_field|
+                       bolt_size; default line) y admite filtros por línea,
+                       spec, tamaño (diámetro de brida; exige unidad),
+                       shop_field (shop|field) e item_type (bolt|gasket).
+                       Devuelve siempre los desgloses globales by_item_type y
+                       by_shop_field, y reporta aparte los items sin línea
+                       (untagged). Aquí limit acota el nº de grupos.
+                       data: {project?, group_by?, line?, spec?, size?,
+                       shop_field?, item_type?, limit?}
       list_projects  — Lista proyectos bajo una raíz. data: {root?}
                        (usa AUTOCAD_MCP_PLANT3D_ROOT si no se indica root)
     """
@@ -641,6 +654,9 @@ async def plant3d(
     elif operation == "weld_list":
         project = data.get("project") or await _detect_open_project()
         result = plant3d_query.weld_list(project, data)
+    elif operation == "bolt_gasket_list":
+        project = data.get("project") or await _detect_open_project()
+        result = plant3d_query.bolt_gasket_list(project, data)
     else:
         return _json({"error": f"Unknown plant3d operation: {operation}"})
 
