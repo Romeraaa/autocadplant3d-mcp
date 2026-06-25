@@ -5,6 +5,8 @@ Tools: drawing, entity, layer, block, annotation, pid, view, system
 
 from __future__ import annotations
 
+import os
+
 import structlog
 from mcp.server.fastmcp import FastMCP
 
@@ -656,6 +658,10 @@ async def plant3d(
         result = plant3d_query.list_lines(project, data)
     elif operation == "list_components":
         project = data.get("project") or await _detect_open_project()
+        # "DWG abierto en AutoCAD": active_dwg:true o dwg:"@active" leen DWGNAME
+        # del dibujo activo y lo traducen al basename que casa con PnPDrawings.
+        if data.get("active_dwg") is True or data.get("dwg") == "@active":
+            data["dwg"] = await _detect_active_dwg_name()
         result = plant3d_query.list_components(project, data)
     elif operation == "list_valves":
         project = data.get("project") or await _detect_open_project()
@@ -707,6 +713,36 @@ async def _detect_open_project() -> str:
             "Abre o guarda un dibujo del proyecto."
         )
     return str(plant3d_query.find_project_root(prefix))
+
+
+async def _detect_active_dwg_name() -> str:
+    """Return the basename of the drawing currently open in AutoCAD.
+
+    Reads the ``DWGNAME`` system variable (e.g. ``"23099-PIP-MOD-0001_R9.dwg"``)
+    via the File IPC backend; this basename matches ``PnPDrawings."Dwg Name"``
+    so it can drive the ``dwg`` filter of ``list_components``. Requires AutoCAD
+    open (file_ipc backend); on ezdxf/headless it raises a Spanish error.
+    """
+    backend = await get_backend()
+    if backend.name != "file_ipc":
+        raise RuntimeError(
+            f"No hay AutoCAD abierto (backend actual: {backend.name}). "
+            "Para filtrar por el DWG activo abre el dibujo en AutoCAD, o indica "
+            "'dwg' con el nombre del archivo (p.ej. '23099-PIP-MOD-0001_R9.dwg')."
+        )
+
+    res = await backend.drawing_get_variables(["DWGNAME"])
+    if not res.ok:
+        raise RuntimeError(
+            f"No se pudo leer el nombre del dibujo activo: {res.error}"
+        )
+    dwgname = (res.payload or {}).get("DWGNAME")
+    if not dwgname:
+        raise RuntimeError(
+            "El dibujo activo no tiene nombre (¿sin guardar?). "
+            "Guarda el dibujo o indica 'dwg' explícitamente."
+        )
+    return os.path.basename(str(dwgname))
 
 
 _PLUGIN_REQUIRED_MSG = (

@@ -10,6 +10,7 @@ All access is strictly read-only: databases are opened with SQLite's
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 from urllib.parse import quote
@@ -310,6 +311,58 @@ def resolve_handles(project: str, pnpids: list[int]) -> list[dict]:
             continue
         seen.add(key)
         out.append({"pnpid": int(r["pnpid"]), "dwg": dwg, "handle": handle})
+    return out
+
+
+def pnpids_in_dwg(project: str, dwg_name: str) -> set[int]:
+    """Return the set of PnPIDs physically present in a given drawing.
+
+    Resolves which objects live in ``dwg_name`` by joining ``PnPDataLinks``
+    (``RowId`` is the object's PnPID, ``DwgId`` points at a drawing) to
+    ``PnPDrawings`` (``"Dwg Name"`` is the drawing basename, e.g.
+    ``"23099-PIP-MOD-0001_R9.dwg"``). The same object (PnPID) may appear in
+    several drawings; only those whose drawing matches ``dwg_name`` are kept.
+
+    ``dwg_name`` is matched by basename, case-insensitively, so callers may
+    pass either a bare filename or a full path (``os.path.basename`` is applied
+    on both sides). An empty/blank ``dwg_name`` yields an empty set.
+
+    Tolerant by design: if the project lacks the PnPDataLinks/PnPDrawings
+    tables (or the expected columns), an empty set is returned instead of
+    raising.
+    """
+    base = os.path.basename(str(dwg_name).strip()) if dwg_name else ""
+    if not base:
+        return set()
+
+    project_dir = resolve_project_dir(project)
+    db = _db_path(project_dir, "Piping.dcf")
+
+    con = _connect_ro(db)
+    try:
+        cur = con.cursor()
+        try:
+            rows = cur.execute(
+                """
+                SELECT dl.RowId      AS pnpid,
+                       dr."Dwg Name" AS dwg
+                FROM PnPDataLinks dl
+                JOIN PnPDrawings dr ON dr.PnPID = dl.DwgId
+                WHERE dr."Dwg Name" IS NOT NULL
+                """
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # Missing table/column on this project: be tolerant.
+            return set()
+    finally:
+        con.close()
+
+    target = base.lower()
+    out: set[int] = set()
+    for r in rows:
+        dwg = r["dwg"]
+        if dwg and os.path.basename(str(dwg)).lower() == target:
+            out.add(int(r["pnpid"]))
     return out
 
 
@@ -1182,6 +1235,11 @@ def list_components(project: str, data: dict | None = None) -> dict:
       avoid mixing inches and millimetres: pass ``{"value": <num>, "unit":
       "in"|"mm"}``. ``size`` without a usable unit is NOT applied (the size
       filter is skipped and a note is added) rather than guessing a unit.
+    * ``dwg`` — keep only components physically present in the given drawing
+      (basename, case-insensitive; a full path is reduced to its basename).
+      Resolved via :func:`pnpids_in_dwg` (PnPDataLinks ⋈ PnPDrawings), so it
+      includes untagged components (``LineNumberTag`` ``?``) that
+      :func:`list_lines` cannot see. Combinable with every other filter.
     * ``limit`` — max components returned (default 50, 0 = no cap). Omitted
       components are reported via ``omitted``, never truncated silently.
 
@@ -1241,6 +1299,22 @@ def list_components(project: str, data: dict | None = None) -> dict:
     spec_filter = data.get("spec")
     spec_norm = _norm(spec_filter) if spec_filter else None
 
+    # --- Parse the DWG filter (components physically in a given drawing) -----
+    # Restricts the inventory to objects that live in ``dwg`` (basename), so a
+    # caller can ask "give me the valves in this drawing" — tagged or not,
+    # which list_lines cannot do because it only sees valid LineNumberTags.
+    dwg_filter = data.get("dwg")
+    dwg_norm = os.path.basename(str(dwg_filter).strip()) if dwg_filter else None
+    dwg_pnpids: set[int] | None = None
+    if dwg_norm:
+        dwg_pnpids = pnpids_in_dwg(project, dwg_norm)
+        if not dwg_pnpids:
+            notes.append(
+                f"El DWG '{dwg_norm}' no tiene componentes asociados en "
+                "PnPDataLinks/PnPDrawings (¿nombre incorrecto o sin objetos de "
+                "tubería?): no se devuelve ningún componente."
+            )
+
     # --- Single SELECT (Tag column probed for graceful degradation) ---------
     con = _connect_ro(db)
     try:
@@ -1285,6 +1359,10 @@ def list_components(project: str, data: dict | None = None) -> dict:
     apply_size = size_value is not None
 
     for r in rows:
+        # --- dwg filter (component physically present in the drawing) --------
+        if dwg_norm is not None and int(r["pnpid"]) not in dwg_pnpids:
+            continue
+
         # --- class filter ---------------------------------------------------
         if apply_class and not _class_matches(r["part_category"]):
             continue
@@ -1353,6 +1431,8 @@ def list_components(project: str, data: dict | None = None) -> dict:
         filters_echo["spec"] = spec_norm
     if size_value is not None:
         filters_echo["size"] = {"value": size_value, "unit": _norm(size_unit)}
+    if dwg_norm is not None:
+        filters_echo["dwg"] = dwg_norm
 
     notes.append(
         "La localización del objeto en el dibujo requiere el plugin .NET; "

@@ -46,6 +46,27 @@ requieren el plugin .NET y nunca modifican el proyecto (apertura `mode=ro`). **E
   `{ok, project, path, limit, filters, count, omitted, by_class, components, notes}`. Cada
   componente: `pnpid`, `class`, `tag` (saneado; NULL/'?'/'?-?' → None), `description`, `spec`,
   `size`, `line`. **No localiza el objeto en el dibujo** (sin handle/GUID en SQLite).
+
+  **Filtro por DWG de modelo** (`data.dwg` / `data.active_dwg`):
+  - `data.dwg`: basename o ruta completa de un DWG de modelo. Restringe el inventario a los
+    componentes que están **físicamente en ese dibujo** (vía tabla `PnPDataLinks`). Incluye los
+    componentes sin `LineNumberTag` válido (placeholder `'?'`), que el filtro `line` y la
+    operación `list_lines` no alcanzarían. Solo lectura sobre `Piping.dcf`; no requiere AutoCAD.
+  - `data.dwg: "@active"` o `data.active_dwg: true`: detecta automáticamente el DWG abierto en
+    AutoCAD (lee la variable `DWGNAME` vía backend File IPC) y filtra por él. Requiere backend
+    `file_ipc` (AutoCAD abierto con dibujo); sobre `ezdxf`/headless devuelve error en español.
+  - Combinable con los filtros existentes (`classes`, `line`, `spec`, `size`, `limit`).
+
+  **Caso de uso clave — piezas sin etiquetar en el DWG activo:** `list_lines` solo lista líneas
+  con `LineNumberTag` válido; los componentes sin etiquetar no aparecen en ella. El filtro
+  `dwg`/`active_dwg` sí los incluye porque opera sobre `PnPDataLinks` (presencia física en el
+  DWG), no sobre el tag. Flujo típico: `list_components {active_dwg:true, class:"valve"}` →
+  elegir un `pnpid` del resultado → `locate` para encuadrar la pieza en el dibujo.
+
+  > **Nota — `list_lines` vs. `dwg`/`locate`:** `list_lines` mira el *tag de línea*
+  > (`LineNumberTag`); el filtro `dwg` y la operación `locate` miran lo que está *físicamente en
+  > el DWG* (tabla `PnPDataLinks` / handles). Pueden no coincidir: una pieza sin etiquetar existe
+  > en el DWG pero no aparece en ninguna línea de `list_lines`.
 - `list_valves` — preset de solo lectura de `list_components` con la clase fijada a válvula
   (`classes=["valve"]`). Cualquier `classes` que pase el usuario se ignora; se conservan los
   filtros restantes: `line`, `spec`, `size` (`{"value", "unit"}`), `limit` (default 50, 0 = sin
