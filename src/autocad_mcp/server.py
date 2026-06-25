@@ -766,7 +766,15 @@ async def _plant3d_locate(data: dict) -> ToolResult:
     zoom = data.get("zoom", True)
     select = data.get("select", True)
 
-    result = await backend.plant_locate(pnpids, zoom, select)
+    # Resolve each PnPID to its drawing handle(s) from the SQLite project DB,
+    # so the plugin can grab objects by handle instead of relying on the
+    # Plant 3D API. A pnpid with no row in PnPDataLinks simply yields no target.
+    from autocad_mcp import plant3d_query
+
+    project = data.get("project") or await _detect_open_project()
+    targets = plant3d_query.resolve_handles(project, pnpids)
+
+    result = await backend.plant_locate(pnpids, targets, zoom, select)
     out = result.to_dict()
     out["operation"] = "locate"
     return _json(out)

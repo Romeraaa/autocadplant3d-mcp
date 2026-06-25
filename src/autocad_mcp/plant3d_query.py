@@ -251,6 +251,68 @@ def line_summary(project: str) -> dict:
     }
 
 
+def resolve_handles(project: str, pnpids: list[int]) -> list[dict]:
+    """Resolve Plant 3D PnPIDs to drawing handles via Piping.dcf (SQLite).
+
+    Each object referenced by ``PnPDataLinks.RowId`` (its PnPID) may live in one
+    or more drawings; this returns one entry per (pnpid, dwg) pair so the .NET
+    plugin can open the right DWG and grab the object by its handle.
+
+    The handle is rebuilt as a signed-friendly Int64 from the two decimal
+    columns ``DwgHandleHigh`` / ``DwgHandleLow``:
+    ``handle = (high << 32) | (low & 0xFFFFFFFF)``.
+
+    Returns a list of ``{"pnpid": int, "dwg": str, "handle": int}``. Rows with no
+    drawing name or no valid low handle are skipped, and exact duplicates are
+    collapsed. If the project has no PnPDataLinks/PnPDrawings tables, an empty
+    list is returned instead of raising.
+    """
+    if not pnpids:
+        return []
+
+    project_dir = resolve_project_dir(project)
+    db = _db_path(project_dir, "Piping.dcf")
+
+    con = _connect_ro(db)
+    try:
+        cur = con.cursor()
+        placeholders = ",".join("?" for _ in pnpids)
+        try:
+            rows = cur.execute(
+                f"""
+                SELECT dl.RowId         AS pnpid,
+                       dl.DwgHandleLow  AS low,
+                       dl.DwgHandleHigh AS high,
+                       dr."Dwg Name"    AS dwg
+                FROM PnPDataLinks dl
+                JOIN PnPDrawings dr ON dr.PnPID = dl.DwgId
+                WHERE dl.RowId IN ({placeholders})
+                """,
+                [int(p) for p in pnpids],
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # Missing table/column on this project: be tolerant.
+            return []
+    finally:
+        con.close()
+
+    seen: set[tuple[int, str, int]] = set()
+    out: list[dict] = []
+    for r in rows:
+        dwg = r["dwg"]
+        low = r["low"]
+        if not dwg or low is None:
+            continue
+        high = r["high"] or 0
+        handle = (int(high) << 32) | (int(low) & 0xFFFFFFFF)
+        key = (int(r["pnpid"]), dwg, handle)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"pnpid": int(r["pnpid"]), "dwg": dwg, "handle": handle})
+    return out
+
+
 def find_untagged(project: str) -> dict:
     """List piping components that lack a line number tag.
 

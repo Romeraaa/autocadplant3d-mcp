@@ -61,6 +61,23 @@ namespace PlantMcpDispatch
         public string? Project { get; set; }
     }
 
+    /// <summary>
+    /// Objetivo de localizacion del comando <c>locate</c> (contrato nuevo):
+    /// una entrada por (pnpid, dwg, handle). Se rellena por parseo manual de
+    /// JsonElement en DispatchCommand.DoLocate; no se deserializa directamente.
+    /// </summary>
+    internal sealed class LocateTarget
+    {
+        // PnPID (rowid del SQLite) al que pertenece el objeto.
+        public int Pnpid { get; set; }
+
+        // Basename del DWG donde vive el objeto (p.ej. "23099-PIP-MOD-0001_R9.dwg").
+        public string? Dwg { get; set; }
+
+        // Valor decimal (Int64) del handle de AutoCAD ya combinado high/low.
+        public long Handle { get; set; }
+    }
+
     /// <summary>Payload de la operacion <c>locate</c>.</summary>
     internal sealed class LocatePayload
     {

@@ -143,8 +143,9 @@ class TestPlantLocate:
         payload = {"requested": [10, 20], "found": [10, 20], "not_found": [], "found_count": 2, "dwg": "model.dwg"}
         backend._type_dispatch_trigger = _patch_trigger_and_write_result(backend, payload, captured)
 
+        targets = [{"pnpid": 10, "dwg": "model.dwg", "handle": 9390}]
         with patch("autocad_mcp.backends.file_ipc.TIMEOUT", 2.0):
-            result = await backend.plant_locate([10, 20], zoom=True, select=False)
+            result = await backend.plant_locate([10, 20], targets, zoom=True, select=False)
 
         assert result.ok is True
         assert result.payload == payload
@@ -152,6 +153,7 @@ class TestPlantLocate:
         assert captured["cmd_path"].name.startswith("autocad_mcp_plant_cmd_")
         assert captured["cmd"]["command"] == "locate"
         assert captured["cmd"]["params"]["pnpids"] == [10, 20]
+        assert captured["cmd"]["params"]["targets"] == targets
         assert captured["cmd"]["params"]["zoom"] is True
         assert captured["cmd"]["params"]["select"] is False
 
@@ -162,10 +164,11 @@ class TestPlantLocate:
         backend._type_dispatch_trigger = _patch_trigger_and_write_result(backend, {"found_count": 1}, captured)
 
         with patch("autocad_mcp.backends.file_ipc.TIMEOUT", 2.0):
-            await backend.plant_locate([5])
+            await backend.plant_locate([5], [])
 
         assert captured["cmd"]["params"]["zoom"] is True
         assert captured["cmd"]["params"]["select"] is True
+        assert captured["cmd"]["params"]["targets"] == []
 
     @pytest.mark.asyncio
     async def test_dispatch_plant_timeout(self, tmp_path):
@@ -219,22 +222,52 @@ class TestSharedLock:
 class _FakeBackend:
     def __init__(self, name):
         self.name = name
+        self.last_targets = None
 
-    async def plant_locate(self, pnpids, zoom=True, select=True):
-        return CommandResult(ok=True, payload={"requested": pnpids, "found_count": len(pnpids)})
+    async def plant_locate(self, pnpids, targets, zoom=True, select=True):
+        self.last_targets = targets
+        return CommandResult(
+            ok=True,
+            payload={
+                "requested": pnpids,
+                "found_count": len(pnpids),
+                "targets": targets,
+            },
+        )
 
     async def plant_ping(self):
         return CommandResult(ok=True, payload={"plugin": "PlantMcpDispatch"})
 
 
-def _patch_backend(name):
-    """Context manager patching server.get_backend to yield a fake backend."""
-    from autocad_mcp import server
+def _patch_backend(name, targets=None):
+    """Context manager-ish helper patching server internals for locate tests.
+
+    Patches:
+    - server.get_backend → a fake backend of the given ``name``.
+    - server._detect_open_project → returns a dummy project string.
+    - plant3d_query.resolve_handles → returns ``targets`` (default []).
+
+    Returns a contextlib.ExitStack already entered; use with ``with``.
+    """
+    import contextlib
+
+    from autocad_mcp import plant3d_query, server
 
     async def fake_get_backend():
         return _FakeBackend(name)
 
-    return patch.object(server, "get_backend", fake_get_backend)
+    async def fake_detect_open_project():
+        return "FAKE_PROJECT"
+
+    stack = contextlib.ExitStack()
+    stack.enter_context(patch.object(server, "get_backend", fake_get_backend))
+    stack.enter_context(
+        patch.object(server, "_detect_open_project", fake_detect_open_project)
+    )
+    stack.enter_context(
+        patch.object(plant3d_query, "resolve_handles", lambda project, pnpids: targets or [])
+    )
+    return stack
 
 
 class TestServerLocateRouting:
@@ -294,6 +327,22 @@ class TestServerLocateRouting:
         parsed = json.loads(out)
         assert parsed["ok"] is True
         assert parsed["payload"]["found_count"] == 3
+
+    @pytest.mark.asyncio
+    async def test_locate_targets_resolved_and_forwarded(self):
+        """resolve_handles' output viaja al backend como 'targets' en el payload."""
+        from autocad_mcp import server
+
+        targets = [
+            {"pnpid": 200171, "dwg": "23099-PIP-MOD-0001_R9.dwg", "handle": 9390}
+        ]
+        with _patch_backend("file_ipc", targets=targets):
+            out = await server.plant3d(operation="locate", data={"pnpids": [200171]})
+
+        parsed = json.loads(out)
+        assert parsed["ok"] is True
+        # El FakeBackend devuelve los targets que recibió en el payload.
+        assert parsed["payload"]["targets"] == targets
 
     @pytest.mark.asyncio
     async def test_plugin_status_non_file_ipc_clear_error(self):

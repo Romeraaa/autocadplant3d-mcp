@@ -133,22 +133,39 @@ requieren el plugin .NET y nunca modifican el proyecto (apertura `mode=ro`). **E
 ## Operaciones vía plugin .NET (NO SQLite)
 
 - `locate` — **EXCEPCION: va por el plugin .NET, NO por SQLite.** Localiza objetos Plant 3D en
-  el DWG abierto por su `PnPID` y los resalta/encuadra (select + zoom). Resuelve PnPID →
-  ObjectId en el DWG activo vía `DataLinksManager` del proyecto Plant 3D; recorre los
-  DataLinksManager de todas las partes del proyecto. Los ObjectId cuya `Database` no sea la
-  del documento activo van a `not_found` (existen en el proyecto pero no en el DWG abierto).
+  el DWG abierto por su `PnPID` y los resalta/encuadra (select + zoom).
+
+  **Admite el parámetro `project`** (igual que el resto de operaciones plant3d): si se omite,
+  detecta el proyecto del dibujo activo subiendo desde `DWGPREFIX` hasta `Project.xml`.
+
+  **Flujo de resolución (vía HANDLE — vía principal):**
+  Python llama a `plant3d_query.resolve_handles(project, pnpids)`, que lee `Piping.dcf`
+  directamente (SQLite, solo lectura) siguiendo la cadena:
+  `PnPDataLinks.RowId`=PnPID del objeto → `DwgId`=`PnPDrawings.PnPID` → handle en
+  `DwgHandleLow/High` → ruta del DWG en `PnPDrawings."Dwg Name"`.
+  El resultado es una lista `targets=[{pnpid, dwg, handle}]` que se envía al plugin junto con
+  `pnpids`. El plugin C# usa `Database.TryGetObjectId(new Handle(handle))` filtrando por el
+  basename del DWG activo, selecciona los objetos encontrados y ejecuta `ZOOM _Object` para
+  encuadrar correctamente (funciona también en vistas 3D). PnPIDs cuyo handle no pertenece al
+  DWG activo van a `not_found` (existen en el proyecto, pero en otro modelo).
+  El enfoque antiguo (`SelectAcPpObjectIds`/`MakeAcDbObjectIds`) se conserva como fallback.
+
   Parámetros: `data={"pnpids": [int]}` (o `pnpid` único; acepta strings numéricas coercionadas
-  a int; rechaza no convertibles y bool con error en español), `zoom?=True`, `select?=True`.
-  Payload: `{requested, found, not_found, found_count, dwg}`. Requiere AutoCAD 2026 abierto
-  con el plugin cargado (NETLOAD) y el DWG del modelo correspondiente abierto.
-  **PENDIENTE DE VALIDACION en AutoCAD vivo** — firmas de API Plant 3D descubiertas con el
-  `probe`, marcadas con comentarios `PENDIENTE DE VALIDAR`; bloqueado por DWG de prueba
-  multi-modelo (pendiente de recibir de la organización). Tests unitarios: 28 (suite 1092
-  verdes). Commit: `b1897a5` (2026-06-25).
+  a int; rechaza no convertibles y bool con error en español), `project` (opcional),
+  `zoom?=True`, `select?=True`.
+  Payload: `{requested, found, not_found, found_count, dwg}`.
+  Requiere AutoCAD 2026 abierto con el plugin cargado (NETLOAD) y el DWG del modelo
+  correspondiente abierto; sobre `ezdxf`/headless devuelve error en español.
+
+  **VALIDADO EN VIVO** (2026-06-25) con el proyecto `23099 - AIR LIQUIDE HUELVA`
+  (DWG `23099-PIP-MOD-0001_R9.dwg`): válvulas PnPID 200171 / 200275 / 200293 localizadas y
+  encuadradas correctamente en vista 3D. Tests unitarios: 28 (suite 1092 verdes).
+  Commits: `b1897a5` (base) + edits del enfoque HANDLE (misma sesión, 2026-06-25).
+
 - `plugin_status` — **EXCEPCION: va por el plugin .NET, NO por SQLite.** Ping al plugin para
   verificar que está cargado y responde. Payload: `{plugin, version, plant3d_available,
-  project}`. Mismas exigencias de backend `file_ipc` que `locate`. Commit: `b1897a5`
-  (2026-06-25).
+  project}`. Mismas exigencias de backend `file_ipc` que `locate`. **VALIDADO EN VIVO**
+  (2026-06-25, proyecto `23099 - AIR LIQUIDE HUELVA`). Commit: `b1897a5` (2026-06-25).
 
 ---
 
@@ -174,11 +191,25 @@ AutoLISP no puede acceder a estas APIs.
 - `_dispatch_core` en `file_ipc.py` parametrizado por prefijo + trigger; limpia comandos huérfanos
   por prefijo antes de escribir
 
+**Cadena de resolución (locate):**
+La vía principal es el HANDLE: Python resuelve `PnPDataLinks` → `PnPDrawings` en `Piping.dcf`
+(SQLite) y envía `targets=[{pnpid, dwg, handle}]` al plugin. El plugin usa
+`Database.TryGetObjectId(new Handle(handle))` filtrando por basename del DWG activo y ejecuta
+`ZOOM _Object`. El enfoque antiguo (`SelectAcPpObjectIds`/`MakeAcDbObjectIds`) se conserva como
+fallback pero devolvía 0 found en vivo y fue descartado como vía principal.
+
+**Recordatorio operativo** (tras abrir o reiniciar AutoCAD):
+1. Cargar `lisp-code/mcp_dispatch.lsp` — sin esto, `system init` falla aunque el plugin esté.
+2. NETLOAD de la DLL del plugin.
+3. Ejecutar `system init` — el backend es un singleton cacheado; sin este paso se queda en `ezdxf`.
+Para recompilar el plugin hay que CERRAR AutoCAD antes (NETLOAD bloquea `bin/Release`).
+
 **Estado actual:**
 - Build C# Release: compila limpia (0 avisos/errores) en el entorno actual (net8.0-windows, VS Code + .NET SDK 9).
 - DLLs en `C:\Program Files\Autodesk\AutoCAD 2026\PLNT3D\` y `...\AutoCAD 2026\`.
 - Tests unitarios: 28 (`tests/test_file_ipc_plant.py`, mockean PostMessage/trigger), suite total 1092 verdes.
-- **`locate` PENDIENTE DE VALIDACION en AutoCAD vivo** — bloqueado por DWG de prueba multi-modelo.
+- **`locate` VALIDADA EN VIVO** (2026-06-25, `23099 - AIR LIQUIDE HUELVA`): PnPIDs 200171/200275/200293 OK.
+- **`plugin_status` VALIDADA EN VIVO** (2026-06-25, mismo proyecto).
 - La ESCRITURA en Plant 3D (p.ej. `assign-layers-by-property`) sigue PENDIENTE / no abordada aún.
 
 > El historial de implementación operación por operación (fechas, conteos de tests, commits,

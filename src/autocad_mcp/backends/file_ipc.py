@@ -261,14 +261,21 @@ class FileIPCBackend(AutoCADBackend):
         async with self._lock:
             return await self._dispatch_plant("ping", {})
 
-    async def plant_locate(self, pnpids, zoom: bool = True, select: bool = True) -> CommandResult:
-        """Locate Plant 3D objects by PnPID in the open drawing via the .NET plugin.
+    async def plant_locate(
+        self, pnpids, targets, zoom: bool = True, select: bool = True
+    ) -> CommandResult:
+        """Locate Plant 3D objects in the open drawing via the .NET plugin.
+
+        ``targets`` carries the pre-resolved drawing handles
+        (``[{"pnpid", "dwg", "handle"}, ...]``) so the plugin grabs objects by
+        handle. ``pnpids`` is still sent for the requested/found/not_found counts.
 
         Payload on success: {requested, found, not_found, found_count, dwg}.
         """
         async with self._lock:
             return await self._dispatch_plant(
-                "locate", {"pnpids": pnpids, "zoom": zoom, "select": select}
+                "locate",
+                {"pnpids": pnpids, "targets": targets, "zoom": zoom, "select": select},
             )
 
     def _find_command_line_hwnd(self) -> int | None:
