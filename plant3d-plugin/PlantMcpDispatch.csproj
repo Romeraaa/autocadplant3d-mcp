@@ -1,0 +1,86 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    PlantMcpDispatch — plugin .NET para AutoCAD Plant 3D 2026.
+    Expone el comando MCPPLANTDISPATCH que atiende ordenes del servidor MCP
+    (Python) mediante ficheros JSON en C:/temp (mismo patron IPC que el LISP).
+    Operaciones que requieren la API .NET de Plant 3D (no accesibles via SQLite/LISP).
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>PlantMcpDispatch</AssemblyName>
+    <RootNamespace>PlantMcpDispatch</RootNamespace>
+    <Version>0.1.0</Version>
+    <!-- No anidar la salida en una subcarpeta por TFM: queremos bin\Release\PlantMcpDispatch.dll -->
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <!-- No generar el .deps.json ni copiar dependencias del framework de Autodesk -->
+    <GenerateDependencyFile>false</GenerateDependencyFile>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <!-- MSB3277: conflictos de version entre DLLs transitivas de Autodesk.
+         Inofensivo: con Private=false no enviamos ninguna; AutoCAD resuelve en runtime. -->
+    <MSBuildWarningsAsMessages>MSB3277</MSBuildWarningsAsMessages>
+  </PropertyGroup>
+
+  <!-- Solo compilamos el codigo del plugin (la carpeta probe/ es un proyecto aparte) -->
+  <ItemGroup>
+    <Compile Include="src\**\*.cs" />
+  </ItemGroup>
+
+  <!-- ====== Referencias AutoCAD .NET API (raiz de AutoCAD 2026) ====== -->
+  <ItemGroup>
+    <Reference Include="accoremgd">
+      <HintPath>C:\Program Files\Autodesk\AutoCAD 2026\accoremgd.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="acdbmgd">
+      <HintPath>C:\Program Files\Autodesk\AutoCAD 2026\acdbmgd.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="acmgd">
+      <HintPath>C:\Program Files\Autodesk\AutoCAD 2026\acmgd.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- PnPDataLinks vive en la raiz de AutoCAD: define DataLinksManager, PpObjectId, PpObjectIdArray -->
+    <Reference Include="PnPDataLinks">
+      <HintPath>C:\Program Files\Autodesk\AutoCAD 2026\PnPDataLinks.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- ====== Referencias Plant 3D (carpeta PLNT3D) ====== -->
+  <!-- Nota: PnP.dll es nativo (sin metadatos managed); no se referencia. -->
+  <ItemGroup>
+    <Reference Include="PnP3dDataManager">
+      <HintPath>C:\Program Files\Autodesk\AutoCAD 2026\PLNT3D\PnP3dDataManager.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="PnP3dObjectsMgd">
+      <HintPath>C:\Program Files\Autodesk\AutoCAD 2026\PLNT3D\PnP3dObjectsMgd.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="PnIdProjectPartsMgd">
+      <HintPath>C:\Program Files\Autodesk\AutoCAD 2026\PLNT3D\PnIdProjectPartsMgd.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Autodesk.ProcessPower.P360.Data">
+      <HintPath>C:\Program Files\Autodesk\AutoCAD 2026\PLNT3D\Autodesk.ProcessPower.P360.Data.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- PnPProjectManagerMgd: PlantApplication, PlantProject, Project, ProjectPartCollection -->
+    <Reference Include="PnPProjectManagerMgd">
+      <HintPath>C:\Program Files\Autodesk\AutoCAD 2026\PLNT3D\PnPProjectManagerMgd.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- PnPDataObjects: PnPRowIdArray (LinkedList<int>) — vive en la raiz de AutoCAD -->
+    <Reference Include="PnPDataObjects">
+      <HintPath>C:\Program Files\Autodesk\AutoCAD 2026\PnPDataObjects.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

@@ -615,9 +615,27 @@ async def plant3d(
                        shop_field?, item_type?, limit?}
       list_projects  — Lista proyectos bajo una raíz. data: {root?}
                        (usa AUTOCAD_MCP_PLANT3D_ROOT si no se indica root)
+      locate         — Localiza objetos Plant 3D en el DIBUJO por PnPID y los
+                       resalta/encuadra. A diferencia de las consultas SQLite
+                       (que solo leen los .dcf), esta operación SÍ localiza el
+                       objeto en el modelo 3D. Va por el plugin .NET, NO por
+                       SQLite: requiere AutoCAD 2026 abierto con el plugin
+                       PlantMcpDispatch cargado (NETLOAD) y el DWG de modelo
+                       correspondiente abierto.
+                       data: {pnpids: [int] (o pnpid único), zoom?=True,
+                       select?=True}
+      plugin_status  — Comprueba que el plugin .NET responde (ping). Devuelve
+                       {plugin, version, plant3d_available, project}. Requiere
+                       AutoCAD abierto con el plugin cargado (NETLOAD).
     """
     data = data or {}
     from autocad_mcp import plant3d_query
+
+    # --- Plugin .NET (File IPC, NO SQLite): locate / plugin_status ---
+    if operation == "locate":
+        return await _plant3d_locate(data)
+    elif operation == "plugin_status":
+        return await _plant3d_plugin_status()
 
     if operation == "list_projects":
         result = plant3d_query.list_projects(data.get("root"))
@@ -689,6 +707,78 @@ async def _detect_open_project() -> str:
             "Abre o guarda un dibujo del proyecto."
         )
     return str(plant3d_query.find_project_root(prefix))
+
+
+_PLUGIN_REQUIRED_MSG = (
+    "plant3d.locate requiere AutoCAD 2026 abierto con el plugin "
+    "PlantMcpDispatch cargado (NETLOAD)."
+)
+
+
+async def _require_plant_plugin_backend():
+    """Return the active backend, requiring file_ipc for plugin operations.
+
+    plant3d.locate / plugin_status go through the .NET plugin over File IPC
+    (not SQLite), so they need AutoCAD open with the plugin loaded. On any
+    other backend (e.g. ezdxf/headless) raise a clear Spanish error.
+    """
+    backend = await get_backend()
+    if backend.name != "file_ipc":
+        raise RuntimeError(_PLUGIN_REQUIRED_MSG)
+    return backend
+
+
+async def _plant3d_locate(data: dict) -> ToolResult:
+    """Locate Plant 3D objects in the drawing by PnPID via the .NET plugin."""
+    backend = await _require_plant_plugin_backend()
+
+    # Normalize pnpids: accept a single 'pnpid' or a 'pnpids' list.
+    pnpids = data.get("pnpids")
+    if pnpids is None and data.get("pnpid") is not None:
+        pnpids = [data["pnpid"]]
+    if isinstance(pnpids, int):
+        pnpids = [pnpids]
+    if not pnpids:
+        return _json({
+            "ok": False,
+            "error": "plant3d.locate requiere 'pnpids' (lista de enteros) no vacía.",
+        })
+
+    # Coerce/validate every element to int (the C# plugin uses int.TryParse,
+    # so numeric strings are acceptable). Reject non-integer values early
+    # instead of letting the plugin silently drop them.
+    coerced: list[int] = []
+    for p in pnpids:
+        if isinstance(p, bool):  # bool is a subclass of int — not a valid PnPID
+            return _json({
+                "ok": False,
+                "error": "plant3d.locate requiere que todos los 'pnpids' sean enteros.",
+            })
+        try:
+            coerced.append(int(p))
+        except (TypeError, ValueError):
+            return _json({
+                "ok": False,
+                "error": "plant3d.locate requiere que todos los 'pnpids' sean enteros.",
+            })
+    pnpids = coerced
+
+    zoom = data.get("zoom", True)
+    select = data.get("select", True)
+
+    result = await backend.plant_locate(pnpids, zoom, select)
+    out = result.to_dict()
+    out["operation"] = "locate"
+    return _json(out)
+
+
+async def _plant3d_plugin_status() -> ToolResult:
+    """Ping the Plant 3D .NET plugin to verify it is loaded and responsive."""
+    backend = await _require_plant_plugin_backend()
+    result = await backend.plant_ping()
+    out = result.to_dict()
+    out["operation"] = "plugin_status"
+    return _json(out)
 
 
 # ==========================================================================

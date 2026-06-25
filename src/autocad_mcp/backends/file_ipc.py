@@ -133,16 +133,72 @@ class FileIPCBackend(AutoCADBackend):
     # --- IPC dispatch ---
 
     async def _dispatch(self, command: str, params: dict) -> CommandResult:
-        """Send a command via file IPC and wait for result."""
+        """Send a command to the LISP dispatcher via file IPC and wait for result."""
         async with self._lock:
             return await self._dispatch_unlocked(command, params)
 
     async def _dispatch_unlocked(self, command: str, params: dict) -> CommandResult:
-        """Core IPC logic (must be called under _lock)."""
+        """Core LISP IPC logic (must be called under _lock).
+
+        Uses the LISP file prefix and the '(c:mcp-dispatch)' trigger.
+        """
+        return await self._dispatch_core(
+            command,
+            params,
+            cmd_prefix="autocad_mcp_cmd_",
+            result_prefix="autocad_mcp_result_",
+            trigger="(c:mcp-dispatch)",
+        )
+
+    async def _dispatch_plant(self, command: str, params: dict) -> CommandResult:
+        """Core Plant 3D plugin IPC logic (must be called under _lock).
+
+        Mirrors _dispatch_unlocked but targets the .NET plugin's file space
+        (autocad_mcp_plant_cmd_/result_) and triggers the AutoCAD command
+        'MCPPLANTDISPATCH' (typed as a bare command name, no parentheses,
+        unlike the LISP '(c:mcp-dispatch)').
+        """
+        return await self._dispatch_core(
+            command,
+            params,
+            cmd_prefix="autocad_mcp_plant_cmd_",
+            result_prefix="autocad_mcp_plant_result_",
+            trigger="MCPPLANTDISPATCH",
+        )
+
+    async def _dispatch_core(
+        self,
+        command: str,
+        params: dict,
+        cmd_prefix: str,
+        result_prefix: str,
+        trigger: str,
+    ) -> CommandResult:
+        """Shared file-IPC core, parametrized by file prefix and dispatch trigger.
+
+        Must be called under _lock so only one command is in flight across both
+        the LISP and the plugin paths.
+        """
         request_id = uuid.uuid4().hex[:12]
-        cmd_file = self._ipc_dir / f"autocad_mcp_cmd_{request_id}.json"
-        result_file = self._ipc_dir / f"autocad_mcp_result_{request_id}.json"
+        cmd_file = self._ipc_dir / f"{cmd_prefix}{request_id}.json"
+        result_file = self._ipc_dir / f"{result_prefix}{request_id}.json"
         tmp_file = cmd_file.with_suffix(".tmp")
+
+        # Remove any orphaned command files from a previous dispatch that died
+        # mid-write. We run under _lock, so no legitimate command of this prefix
+        # can be in flight; a stale {cmd_prefix}*.json would otherwise be picked
+        # up by the next plugin/LISP trigger (the plugin takes the oldest .json).
+        # Result files are left untouched.
+        for orphan in self._ipc_dir.glob(f"{cmd_prefix}*.json"):
+            try:
+                orphan.unlink()
+            except OSError:
+                pass
+        for orphan in self._ipc_dir.glob(f"{cmd_prefix}*.tmp"):
+            try:
+                orphan.unlink()
+            except OSError:
+                pass
 
         try:
             # Strip None values — the simple LISP JSON parser can't handle null
@@ -157,16 +213,18 @@ class FileIPCBackend(AutoCADBackend):
             tmp_file.write_text(json.dumps(payload), encoding="utf-8")
             tmp_file.rename(cmd_file)
 
-            # Type the fixed dispatch trigger
-            self._type_dispatch_trigger()
+            # Type the dispatch trigger (LISP form or plugin command name)
+            self._type_dispatch_trigger(trigger)
 
             # Poll for result
             deadline = time.time() + TIMEOUT
             while time.time() < deadline:
                 if result_file.exists():
                     try:
-                        # AutoCAD LISP writes files in Windows-1252 encoding;
-                        # try UTF-8 first (covers ASCII), fall back to cp1252
+                        # Try UTF-8 first, fall back to cp1252. The .NET plugin
+                        # always writes UTF-8 (no BOM); the cp1252 fallback only
+                        # applies to the LISP path, where AutoCAD may write the
+                        # result in Windows-1252 encoding.
                         try:
                             text = result_file.read_text(encoding="utf-8")
                         except UnicodeDecodeError:
@@ -193,6 +251,26 @@ class FileIPCBackend(AutoCADBackend):
                 except OSError:
                     pass
 
+    # --- Plant 3D plugin (.NET) dispatch ---
+
+    async def plant_ping(self) -> CommandResult:
+        """Ping the Plant 3D .NET plugin (MCPPLANTDISPATCH).
+
+        Payload on success: {plugin, version, plant3d_available, project}.
+        """
+        async with self._lock:
+            return await self._dispatch_plant("ping", {})
+
+    async def plant_locate(self, pnpids, zoom: bool = True, select: bool = True) -> CommandResult:
+        """Locate Plant 3D objects by PnPID in the open drawing via the .NET plugin.
+
+        Payload on success: {requested, found, not_found, found_count, dwg}.
+        """
+        async with self._lock:
+            return await self._dispatch_plant(
+                "locate", {"pnpids": pnpids, "zoom": zoom, "select": select}
+            )
+
     def _find_command_line_hwnd(self) -> int | None:
         """Find AutoCAD's MDIClient child window for command routing."""
         if sys.platform != "win32" or not self._hwnd:
@@ -213,8 +291,11 @@ class FileIPCBackend(AutoCADBackend):
         except Exception:
             return None
 
-    def _type_dispatch_trigger(self):
-        """Post '(c:mcp-dispatch)' + Enter via WM_CHAR to MDIClient — no focus steal.
+    def _type_dispatch_trigger(self, trigger: str = "(c:mcp-dispatch)"):
+        """Post `trigger` + Enter via WM_CHAR to MDIClient — no focus steal.
+
+        Defaults to the LISP dispatcher form '(c:mcp-dispatch)'. The Plant 3D
+        .NET plugin passes its bare command name 'MCPPLANTDISPATCH' instead.
 
         Sends ESC keystrokes first to cancel any stale pending command
         (e.g. from a previous timeout leaving AutoCAD in a command prompt).
@@ -235,7 +316,7 @@ class FileIPCBackend(AutoCADBackend):
                 post(target, WM_KEYUP, VK_ESCAPE, 0)
             time.sleep(0.05)
 
-            for ch in "(c:mcp-dispatch)":
+            for ch in trigger:
                 post(target, WM_CHAR, ord(ch), 0)
             # Enter = carriage return
             post(target, WM_CHAR, 0x0D, 0)
