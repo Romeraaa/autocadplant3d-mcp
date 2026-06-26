@@ -148,6 +148,91 @@ requieren el plugin .NET y nunca modifican el proyecto (apertura `mode=ro`). **E
   totales 0, listas vacías, nota) si faltan las tablas, columnas opcionales (`NumberInSet` /
   `BoltSize` / `Shop_Field`) o las tablas/columnas de relación de línea. **No localiza el objeto
   en el dibujo** (sin handle/GUID en SQLite — para eso usar `locate`).
+- `find_missing_properties` — lista los componentes con propiedades obligatorias vacías o NULL.
+  Solo lectura; NO emite SQL propio: agrega internamente la salida completa de `list_components`
+  (sin tope) y evalúa cada componente contra un **perfil por clase canónica**.
+
+  **Perfil por defecto:**
+
+  | Clase canónica | Campos requeridos |
+  |---|---|
+  | `pipe` | `spec`, `size`, `line` |
+  | `valve` | `spec`, `size`, `line`, `tag` |
+  | `fitting` | `spec`, `size`, `line` |
+  | `flange` | `spec`, `size`, `line` |
+  | `instrument` | `tag`, `line` |
+  | cualquier otra | `spec`, `size`, `line` |
+
+  Un campo cuenta como ausente cuando es None, cadena vacía o solo espacios. `tag` adicionalmente
+  detecta placeholders del tipo `"?"` / `"?-?"`. `size` también trata `"?"` como ausente.
+
+  **Parámetros en `data`:**
+  - `required` (opcional) — sobreescribe el perfil. Dos formas:
+    - Lista plana `["spec","line"]` — se aplica a TODAS las clases.
+    - Dict `{"valve": ["tag"], "pipe": ["spec","size","line"]}` — reemplaza solo las clases
+      indicadas; las demás conservan su perfil por defecto.
+    - Campos fuera de `{spec, size, line, tag, description}` se descartan con una nota en
+      español en `notes`.
+  - `classes` / `line` / `spec` / `dwg` — filtros de alcance idénticos a `list_components`,
+    reenviados tal cual.
+  - `limit` — máximo de componentes CON al menos un campo ausente que se devuelven (default 50,
+    0 = sin tope). Los excluidos se reportan en `omitted`; nunca se trunca silenciosamente.
+
+  **Salida:** `{ok, project, path, profile, filters, count, omitted, by_class, components, notes}`.
+  - `profile` — perfil efectivo aplicado (refleja los overrides si los hay).
+  - `count` — total de componentes con al menos un campo ausente (antes de aplicar `limit`).
+  - `by_class` — lista `[{class, count}]` ordenada descendente por `count`.
+  - `components` — lista de componentes marcados. Cada entrada: `{pnpid, class, tag, line, missing}`,
+    donde `missing` es la lista de nombres de campo ausentes para ese componente.
+
+  **No localiza el objeto en el dibujo** (sin handle/GUID en SQLite — para eso usar `locate`).
+  Garantía de solo lectura: los `.dcf` no se modifican.
+
+- `export` — vuelca cualquier listado del proyecto a un fichero **CSV o XLSX**. Solo lectura sobre
+  los `.dcf`; el único fichero escrito es el de salida. Crea los directorios padre si no existen.
+
+  **Parámetros obligatorios en `data`:**
+  - `kind` — qué listado exportar. Valores admitidos:
+
+    | `kind` | Función subyacente | Filas exportadas |
+    |---|---|---|
+    | `lines` | `list_lines` | una por línea |
+    | `components` | `list_components` | una por componente |
+    | `valves` | `list_valves` | una por válvula |
+    | `instruments` | `list_instruments` | una por instrumento |
+    | `equipment` | `list_equipment` | una por equipo |
+    | `bom` | `bom` | una por línea de BOM |
+    | `pipe_length` | `pipe_length` | una por grupo de longitud |
+    | `weld_list` | `weld_list` | una por grupo de soldadura |
+    | `bolt_gasket_list` | `bolt_gasket_list` | una por grupo pernos/juntas |
+    | `specs` | `list_specs` | una por spec |
+    | `untagged` | `find_untagged` | una por componente sin etiquetar |
+
+  - `path` — ruta del fichero de salida. El formato se deduce por extensión: `.csv` (CSV
+    `utf-8-sig`, con BOM para que Excel reconozca acentos) o `.xlsx` (una hoja, primera fila
+    = cabecera). Cualquier otra extensión devuelve `ok:False` con mensaje en español.
+
+  **Parámetros opcionales:**
+  - Cualquier otro campo en `data` (excepto `kind`, `path` y `project`) se reenvía como filtro
+    a la consulta subyacente (`line`, `spec`, `classes`, `group_by`, etc.).
+  - `limit` — ignorado: la exportación fuerza siempre `limit=0` (sin tope) para no truncar el
+    fichero. Se añade una nota en `notes` cuando el llamante lo incluía.
+  - `untagged` no acepta filtros (firma sin `data`): si se pasan, se ignoran con una nota.
+
+  **Columnas:** unión ordenada estable de las claves de todas las filas. Los valores compuestos
+  (listas, dicts anidados) se serializan como JSON compacto en la celda.
+
+  **Dependencia XLSX:** requiere `openpyxl>=3.1`. Si no está instalado, devuelve
+  `{ok:False, error:"Para exportar a XLSX instala openpyxl"}` sin escribir el fichero. No afecta
+  a la exportación CSV.
+
+  **Salida (metadatos, nunca los datos en sí):**
+  `{ok, project, path, kind, format, rows, columns, notes}`.
+  - `format` — `"csv"` o `"xlsx"`.
+  - `rows` — número de filas de datos escritas (sin contar la cabecera).
+  - `columns` — lista ordenada de nombres de columna.
+
+  **Garantía de solo lectura:** los `.dcf` quedan byte-idénticos tras la exportación.
 
 ---
 

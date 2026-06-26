@@ -650,6 +650,47 @@ async def plant3d(
                        data: {pnpid | tag, project?}
                        Devuelve {ok, project, pnpid, class, properties, dwgs,
                        notes}; pnpid inexistente → ok:False.
+      find_missing_properties — Lista los componentes a los que les faltan
+                       propiedades obligatorias, según un perfil por clase
+                       configurable. Se apoya en list_components (solo lectura,
+                       sin SQL propio): para cada componente comprueba los
+                       campos requeridos de SU clase canónica (pipe/valve/
+                       fitting/flange/instrument; el resto usa el perfil por
+                       defecto). Un campo cuenta como faltante si está vacío
+                       (None/""/espacios); 'tag' usa el criterio de tag en
+                       blanco y 'size' considera faltante también el valor "?".
+                       Perfil por defecto: pipe/fitting/flange=[spec,size,line],
+                       valve=[spec,size,line,tag], instrument=[tag,line].
+                       data['required'] sobrescribe el perfil: una lista de
+                       campos (aplica a TODAS las clases) o un dict {clase:
+                       [campos]} (sustituye solo las clases citadas). Campos
+                       válidos: spec,size,line,tag,description; uno desconocido
+                       se ignora con nota. Filtros opcionales reenviados:
+                       classes, line, spec, dwg. limit acota los componentes con
+                       faltantes (default 50, 0 = sin tope).
+                       data: {project?, required?, classes?, line?, spec?, dwg?,
+                       limit?}
+                       Devuelve {ok, project, path, profile, filters, count,
+                       omitted, by_class, components:[{pnpid, class, tag, line,
+                       missing}], notes}.
+      export         — Vuelca cualquier listado a un fichero CSV o XLSX. Solo
+                       lectura sobre los .dcf: el único fichero que se ESCRIBE
+                       es el de salida. kind (obligatorio) elige el listado:
+                       lines | components | valves | instruments | equipment |
+                       bom | pipe_length | weld_list | bolt_gasket_list | specs
+                       | untagged. path (obligatorio) fija la salida; el formato
+                       se decide por extensión: .csv (utf-8-sig, para que Excel
+                       respete acentos) o .xlsx (openpyxl; una hoja, primera
+                       fila = cabeceras). Otra extensión → error. Crea las
+                       carpetas padre si faltan. El resto de data se reenvía como
+                       filtros al listado subyacente y limit se fuerza a 0 (sin
+                       tope) para no truncar la exportación. Columnas = unión
+                       ordenada y estable de las claves de las filas; un valor
+                       anidado se serializa a texto compacto. Si falta openpyxl
+                       al exportar a XLSX → ok:False con mensaje (no afecta CSV).
+                       data: {kind, path, project?, ...filtros del kind}
+                       Devuelve {ok, project, path, kind, format, rows, columns,
+                       notes} (solo metadatos, nunca los datos).
       list_projects  — Lista proyectos bajo una raíz. data: {root?}
                        (usa AUTOCAD_MCP_PLANT3D_ROOT si no se indica root)
       list_drawings  — Lista y clasifica los dibujos del proyecto (PnPDrawings
@@ -761,6 +802,12 @@ async def plant3d(
     elif operation == "get_component":
         project = data.get("project") or await _detect_open_project()
         result = plant3d_query.get_component(project, data)
+    elif operation == "find_missing_properties":
+        project = data.get("project") or await _detect_open_project()
+        result = plant3d_query.find_missing_properties(project, data)
+    elif operation == "export":
+        project = data.get("project") or await _detect_open_project()
+        result = plant3d_query.export(project, data)
     else:
         return _json({"error": f"Unknown plant3d operation: {operation}"})
 

@@ -4039,3 +4039,419 @@ def get_component(project: str, data: dict) -> dict:
         }
     finally:
         con.close()
+
+
+# ---------------------------------------------------------------------------
+# F2 — Missing mandatory properties (read-only, on top of list_components)
+# ---------------------------------------------------------------------------
+
+# The set of component fields a required-properties profile may reference.
+# These are exactly the normalized fields list_components already returns, so
+# the check reuses its output instead of re-querying the database.
+_MISSING_PROP_FIELDS: set[str] = {"spec", "size", "line", "tag", "description"}
+
+# Default required-properties profile keyed by canonical class. Classes not
+# listed (and any unknown PartCategory) fall back to ``_MISSING_PROP_DEFAULT``.
+_MISSING_PROP_PROFILE: dict[str, list[str]] = {
+    "pipe": ["spec", "size", "line"],
+    "valve": ["spec", "size", "line", "tag"],
+    "fitting": ["spec", "size", "line"],
+    "flange": ["spec", "size", "line"],
+    "instrument": ["tag", "line"],
+}
+_MISSING_PROP_DEFAULT: list[str] = ["spec", "size", "line"]
+
+
+def _canonical_class(part_category: str | None) -> str:
+    """Map a raw ``PartCategory`` to a canonical profile key.
+
+    Uses the same normalized criterion as ``_CLASS_MAP`` (TRIM+UPPER): a raw
+    category such as ``"Pipe"``/``"Valves"``/``"Fittings"``/``"Olet"``/
+    ``"Flanges"``/``"Instruments"`` resolves to ``pipe``/``valve``/``fitting``/
+    ``flange``/``instrument``. Anything else (including NULL/empty supports)
+    returns ``"other"``, which takes the default profile.
+    """
+    norm_cat = _norm(part_category)
+    for canonical, raw_values in _CLASS_MAP.items():
+        if norm_cat in raw_values:
+            return canonical
+    return "other"
+
+
+def _field_is_missing(field: str, value) -> bool:
+    """True if ``value`` for ``field`` counts as an absent mandatory property.
+
+    Blank means None / "" / whitespace-only. ``tag`` uses the lenient
+    ``_is_blank_tag`` (placeholders like ``?`` / ``?-?`` count as missing); for
+    ``size`` the formatted placeholder ``"?"`` also counts as missing.
+    """
+    if field == "tag":
+        return _is_blank_tag(value)
+    if value is None:
+        return True
+    text = str(value).strip()
+    if text == "":
+        return True
+    if field == "size" and text == "?":
+        return True
+    return False
+
+
+def find_missing_properties(project: str, data: dict | None = None) -> dict:
+    """List components missing mandatory properties, per a per-class profile.
+
+    Read-only aggregation built ENTIRELY on top of :func:`list_components`
+    (no own SQL): it reads every matching component with no cap and, for each
+    one, checks the fields required by ITS canonical class against the already
+    normalized values list_components returns (``spec``, ``size``, ``line``,
+    ``tag``, ``description``). A field counts as missing when blank (None / ""
+    / whitespace); ``tag`` uses :func:`_is_blank_tag` and ``size`` also treats
+    the placeholder ``"?"`` as missing.
+
+    The default profile (required fields per canonical class) is::
+
+        pipe       -> spec, size, line
+        valve      -> spec, size, line, tag
+        fitting    -> spec, size, line
+        flange     -> spec, size, line
+        instrument -> tag, line
+        (other/unknown) -> spec, size, line
+
+    ``data`` accepts:
+
+    * ``required`` — override the profile. Either a flat list of fields
+      (applied to EVERY class) or a dict ``{canonical_class: [fields]}`` that
+      REPLACES the profile of the named classes (others keep their default).
+      Unknown field names (outside ``spec/size/line/tag/description``) are
+      dropped with a warning note.
+    * ``classes`` / ``line`` / ``spec`` / ``dwg`` — scope filters forwarded
+      verbatim to :func:`list_components`.
+    * ``limit`` — max components returned, applied OVER the components that have
+      at least one missing field (default 50, 0 = no cap). Omitted ones are
+      reported via ``omitted``, never truncated silently.
+
+    The caller's ``data`` dict is never mutated.
+    """
+    data = data or {}
+    limit = data.get("limit", _DEFAULT_LIMIT)
+    notes: list[str] = []
+
+    # --- Build the effective per-class profile -----------------------------
+    profile: dict[str, list[str]] = {
+        k: list(v) for k, v in _MISSING_PROP_PROFILE.items()
+    }
+    profile.setdefault("other", list(_MISSING_PROP_DEFAULT))
+
+    def _clean_fields(fields, *, context: str) -> list[str]:
+        """Validate a field list, dropping unknowns with a note."""
+        cleaned: list[str] = []
+        for f in fields:
+            key = str(f).strip().lower()
+            if key in _MISSING_PROP_FIELDS:
+                if key not in cleaned:
+                    cleaned.append(key)
+            else:
+                notes.append(
+                    f"Campo requerido desconocido '{f}'{context}: ignorado "
+                    f"(válidos: {', '.join(sorted(_MISSING_PROP_FIELDS))})."
+                )
+        return cleaned
+
+    required_raw = data.get("required")
+    if required_raw is not None:
+        if isinstance(required_raw, dict):
+            for cls_key, fields in required_raw.items():
+                canonical = str(cls_key).strip().lower()
+                cleaned = _clean_fields(
+                    fields if isinstance(fields, (list, tuple)) else [fields],
+                    context=f" para la clase '{canonical}'",
+                )
+                profile[canonical] = cleaned
+        elif isinstance(required_raw, (list, tuple)):
+            cleaned = _clean_fields(required_raw, context="")
+            # Flat list -> apply to every class (including the 'other' bucket).
+            profile = {k: list(cleaned) for k in profile}
+            profile["other"] = list(cleaned)
+        else:
+            notes.append(
+                "data['required'] debe ser una lista de campos o un dict "
+                "{clase: [campos]}: se ignora y se usa el perfil por defecto."
+            )
+
+    # --- Read every matching component (no inner cap) ----------------------
+    inner = list_components(
+        project,
+        {
+            "classes": data.get("classes"),
+            "line": data.get("line"),
+            "spec": data.get("spec"),
+            "dwg": data.get("dwg"),
+            "limit": 0,  # no cap: evaluate over every component
+        },
+    )
+    # Propagate the base reader's notes (e.g. missing Tag column, dwg filter).
+    notes.extend(inner.get("notes", []))
+
+    # --- Evaluate each component against its class profile ------------------
+    by_class: dict[str, int] = {}
+    flagged: list[dict] = []
+    for comp in inner.get("components", []):
+        canonical = _canonical_class(comp.get("class"))
+        required = profile.get(canonical, profile["other"])
+        missing = [f for f in required if _field_is_missing(f, comp.get(f))]
+        if not missing:
+            continue
+        cls_label = (
+            comp["class"]
+            if comp.get("class") is not None and str(comp["class"]).strip()
+            else "(sin clase)"
+        )
+        by_class[cls_label] = by_class.get(cls_label, 0) + 1
+        flagged.append(
+            {
+                "pnpid": comp.get("pnpid"),
+                "class": comp.get("class"),
+                "tag": comp.get("tag"),
+                "line": comp.get("line"),
+                "missing": missing,
+            }
+        )
+
+    by_class_ranked = [
+        {"class": name, "count": count}
+        for name, count in sorted(by_class.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+
+    count = len(flagged)
+    capped, omitted = _capped(flagged, limit)
+
+    filters_echo = dict(inner.get("filters", {}))
+
+    return {
+        "ok": True,
+        "project": inner["project"],
+        "path": inner["path"],
+        "profile": profile,
+        "filters": filters_echo,
+        "count": count,
+        "omitted": omitted,
+        "by_class": by_class_ranked,
+        "components": capped,
+        "notes": notes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# F1 — Export any listing to CSV / XLSX (read-only on the .dcf; writes output)
+# ---------------------------------------------------------------------------
+
+# Aplanado por kind (clave de detalle elegida):
+#   lines        -> list_lines          / "lines"      (una fila por línea)
+#   components   -> list_components      / "components" (una fila por componente)
+#   valves       -> list_valves          / "components"
+#   instruments  -> list_instruments     / "components"
+#   equipment    -> list_equipment       / "equipment"
+#   bom          -> bom                   / "bom"        (líneas de BOM)
+#   pipe_length  -> pipe_length           / "groups"     (grupos de longitud)
+#   weld_list    -> weld_list             / "groups"     (grupos de soldadura)
+#   bolt_gasket_list -> bolt_gasket_list  / "groups"     (grupos pernos/juntas)
+#   specs        -> list_specs            / "specs"
+#   untagged     -> find_untagged         / "components"
+#
+# Nota de ambigüedad: weld_list / bolt_gasket_list / pipe_length devuelven la
+# lista PRINCIPAL de filas bajo "groups" (filas ya agregadas por group_by); no
+# exponen un detalle por-soldadura/por-perno individual en su dict de salida,
+# así que "groups" ES la lista de filas exportable. find_untagged no acepta
+# ``data`` (firma ``find_untagged(project)``), por lo que sus filtros se ignoran.
+
+
+def _export_row_list(result: dict, preferred_key: str | None) -> list[dict]:
+    """Locate the principal list-of-dicts inside a query result, robustly.
+
+    Tries ``preferred_key`` first; if absent or not a list of dicts, scans the
+    dict for list-valued fields (excluding ``notes``) and returns the first
+    one whose items are dicts, choosing the longest on ties.
+    """
+    if preferred_key and isinstance(result.get(preferred_key), list):
+        candidate = result[preferred_key]
+        if not candidate or isinstance(candidate[0], dict):
+            return candidate
+
+    best: list[dict] | None = None
+    for key, value in result.items():
+        if key == "notes" or not isinstance(value, list):
+            continue
+        if value and not isinstance(value[0], dict):
+            continue
+        if best is None or len(value) > len(best):
+            best = value
+    return best or []
+
+
+def _flatten_cell(value) -> str:
+    """Serialize a cell value to a compact text suitable for CSV/XLSX.
+
+    Scalars (str/int/float/bool) and None pass through their natural text;
+    nested dicts/lists are rendered compactly so a single column never holds a
+    structured object.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float, str)):
+        return str(value)
+    import json
+
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _ordered_columns(rows: list[dict]) -> list[str]:
+    """Stable, ordered union of the keys across ``rows``.
+
+    Preserves the key order of the first row and appends keys seen later that
+    were not present earlier.
+    """
+    columns: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                seen.add(key)
+                columns.append(key)
+    return columns
+
+
+# kind -> (function name in this module, preferred row-list key)
+_EXPORT_KINDS: dict[str, tuple[str, str]] = {
+    "lines": ("list_lines", "lines"),
+    "components": ("list_components", "components"),
+    "valves": ("list_valves", "components"),
+    "instruments": ("list_instruments", "components"),
+    "equipment": ("list_equipment", "equipment"),
+    "bom": ("bom", "bom"),
+    "pipe_length": ("pipe_length", "groups"),
+    "weld_list": ("weld_list", "groups"),
+    "bolt_gasket_list": ("bolt_gasket_list", "groups"),
+    "specs": ("list_specs", "specs"),
+    "untagged": ("find_untagged", "components"),
+}
+
+
+def export(project: str, data: dict | None = None) -> dict:
+    """Dump any Plant 3D listing to a CSV or XLSX file (read-only on the .dcf).
+
+    ``data`` requires:
+
+    * ``kind`` — which listing to export (see ``_EXPORT_KINDS``):
+      ``lines``, ``components``, ``valves``, ``instruments``, ``equipment``,
+      ``bom``, ``pipe_length``, ``weld_list``, ``bolt_gasket_list``, ``specs``,
+      ``untagged``.
+    * ``path`` — output file. Format is chosen by extension: ``.csv`` -> CSV
+      (``utf-8-sig`` so Excel honours accents), ``.xlsx`` -> XLSX (one sheet,
+      first row = headers). Any other extension is an error. Parent folders are
+      created if missing.
+
+    Every other key in ``data`` (except ``kind``, ``path`` and ``project``) is
+    forwarded as filters to the underlying query, and ``limit`` is forced to 0
+    so the export is never truncated (noted in ``notes`` when applicable).
+
+    The only file ever written is ``path``; the project ``.dcf`` databases are
+    only read. Returns metadata only (never the data itself): ``{ok, project,
+    path, kind, format, rows, columns, notes}``.
+    """
+    data = data or {}
+    notes: list[str] = []
+
+    kind = data.get("kind")
+    if not kind:
+        return {"ok": False, "error": "Falta 'kind' (tipo de listado a exportar)."}
+    kind = str(kind).strip().lower()
+    if kind not in _EXPORT_KINDS:
+        return {
+            "ok": False,
+            "error": (
+                f"kind '{kind}' no soportado. Válidos: "
+                f"{', '.join(sorted(_EXPORT_KINDS))}."
+            ),
+        }
+
+    out_path_raw = data.get("path")
+    if not out_path_raw:
+        return {"ok": False, "error": "Falta 'path' (ruta del fichero de salida)."}
+    out_path = Path(out_path_raw)
+    ext = out_path.suffix.lower()
+    if ext == ".csv":
+        fmt = "csv"
+    elif ext == ".xlsx":
+        fmt = "xlsx"
+    else:
+        return {
+            "ok": False,
+            "error": (
+                f"Extensión '{ext or '(ninguna)'}' no soportada: usa .csv o .xlsx."
+            ),
+        }
+
+    # --- Build the filters forwarded to the underlying query ---------------
+    func_name, preferred_key = _EXPORT_KINDS[kind]
+    func = globals()[func_name]
+
+    inner_data = {
+        k: v for k, v in data.items() if k not in ("kind", "path", "project")
+    }
+
+    # find_untagged has signature (project) — no data argument / no filters.
+    if func_name == "find_untagged":
+        if {k: v for k, v in inner_data.items() if k != "limit"}:
+            notes.append(
+                "find_untagged no admite filtros ni limit: se ignoran y se "
+                "exporta el listado completo."
+            )
+        result = func(project)
+    else:
+        inner_data["limit"] = 0  # no cap: never truncate the export
+        notes.append("limit forzado a 0 (sin tope) para no truncar la exportación.")
+        result = func(project, inner_data)
+
+    rows = _export_row_list(result, preferred_key)
+    columns = _ordered_columns(rows)
+
+    # --- Write the output file ---------------------------------------------
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if fmt == "csv":
+        import csv
+
+        with out_path.open("w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(columns)
+            for row in rows:
+                writer.writerow([_flatten_cell(row.get(col)) for col in columns])
+    else:  # xlsx
+        try:
+            from openpyxl import Workbook  # lazy import
+        except ImportError:
+            return {
+                "ok": False,
+                "error": "Para exportar a XLSX instala openpyxl",
+            }
+        wb = Workbook()
+        ws = wb.active
+        ws.append(columns)
+        for row in rows:
+            ws.append([_flatten_cell(row.get(col)) for col in columns])
+        wb.save(str(out_path))
+
+    notes.extend(result.get("notes", []))
+
+    return {
+        "ok": True,
+        "project": result.get("project"),
+        "path": str(out_path),
+        "kind": kind,
+        "format": fmt,
+        "rows": len(rows),
+        "columns": columns,
+        "notes": notes,
+    }
