@@ -170,6 +170,50 @@ class TestPlantLocate:
         assert captured["cmd"]["params"]["select"] is True
         assert captured["cmd"]["params"]["targets"] == []
 
+class TestPlantPnidProbe:
+    @pytest.mark.asyncio
+    async def test_pnid_probe_writes_cmd_with_limit(self, tmp_path):
+        backend = _make_backend(tmp_path)
+        captured: dict = {}
+        payload = {
+            "pnid_part_found": True,
+            "dwg": "pid.dwg",
+            "row_count": 3,
+            "by_class": {"Valve": 2, "Instrument": 1},
+            "sample_rows": [{"rowid": 1, "class": "Valve", "tag": "V-1"}],
+            "line_count": 1,
+            "sample_lines": [{"group_id": 1, "line_number": "L-1", "service": "AIR"}],
+            "notes": [],
+        }
+        backend._type_dispatch_trigger = _patch_trigger_and_write_result(
+            backend, payload, captured
+        )
+
+        with patch("autocad_mcp.backends.file_ipc.TIMEOUT", 2.0):
+            result = await backend.plant_pnid_probe(25)
+
+        assert result.ok is True
+        assert result.payload == payload
+        assert captured["trigger"] == "MCPPLANTDISPATCH"
+        assert captured["cmd_path"].name.startswith("autocad_mcp_plant_cmd_")
+        assert captured["cmd"]["command"] == "pnid_probe"
+        assert captured["cmd"]["params"] == {"limit": 25}
+
+    @pytest.mark.asyncio
+    async def test_pnid_probe_default_limit(self, tmp_path):
+        backend = _make_backend(tmp_path)
+        captured: dict = {}
+        backend._type_dispatch_trigger = _patch_trigger_and_write_result(
+            backend, {"pnid_part_found": False}, captured
+        )
+
+        with patch("autocad_mcp.backends.file_ipc.TIMEOUT", 2.0):
+            await backend.plant_pnid_probe()
+
+        assert captured["cmd"]["params"] == {"limit": 50}
+
+
+class TestPlantLocateTimeout:
     @pytest.mark.asyncio
     async def test_dispatch_plant_timeout(self, tmp_path):
         """No result file written → timeout error, trigger still the plugin one."""
@@ -237,6 +281,13 @@ class _FakeBackend:
 
     async def plant_ping(self):
         return CommandResult(ok=True, payload={"plugin": "PlantMcpDispatch"})
+
+    async def plant_pnid_probe(self, limit=50):
+        self.last_limit = limit
+        return CommandResult(
+            ok=True,
+            payload={"pnid_part_found": True, "limit": limit},
+        )
 
 
 def _patch_backend(name, targets=None):
@@ -365,6 +416,42 @@ class TestServerLocateRouting:
         assert parsed["ok"] is True
         assert parsed["payload"]["plugin"] == "PlantMcpDispatch"
         assert parsed["operation"] == "plugin_status"
+
+
+class TestServerPnidProbeRouting:
+    @pytest.mark.asyncio
+    async def test_pnid_probe_non_file_ipc_clear_error(self):
+        from autocad_mcp import server
+
+        with _patch_backend("ezdxf"):
+            out = await server.plant3d(operation="pnid_probe", data={})
+
+        parsed = json.loads(out)
+        assert "PlantMcpDispatch" in parsed["error"]
+        assert "NETLOAD" in parsed["error"]
+
+    @pytest.mark.asyncio
+    async def test_pnid_probe_on_file_ipc_default_limit(self):
+        from autocad_mcp import server
+
+        with _patch_backend("file_ipc"):
+            out = await server.plant3d(operation="pnid_probe", data={})
+
+        parsed = json.loads(out)
+        assert parsed["ok"] is True
+        assert parsed["operation"] == "pnid_probe"
+        assert parsed["payload"]["limit"] == 50
+
+    @pytest.mark.asyncio
+    async def test_pnid_probe_forwards_limit(self):
+        from autocad_mcp import server
+
+        with _patch_backend("file_ipc"):
+            out = await server.plant3d(operation="pnid_probe", data={"limit": 7})
+
+        parsed = json.loads(out)
+        assert parsed["ok"] is True
+        assert parsed["payload"]["limit"] == 7
 
 
 # ---------------------------------------------------------------------------

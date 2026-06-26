@@ -76,6 +76,16 @@
       <HintPath>C:\Program Files\Autodesk\AutoCAD 2026\PLNT3D\PnPProjectManagerMgd.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <!-- PnIDmgd: Autodesk.ProcessPower.PnIDObjects.LineGroupManager (lineas P&ID, GroupType) -->
+    <Reference Include="PnIDmgd">
+      <HintPath>C:\Program Files\Autodesk\AutoCAD 2026\PLNT3D\PnIDmgd.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- PnIDGuiUtilMgd: Autodesk.ProcessPower.PnIDGUIUtil.TagUtil (tag del activo) -->
+    <Reference Include="PnIDGuiUtilMgd">
+      <HintPath>C:\Program Files\Autodesk\AutoCAD 2026\PLNT3D\PnIDGuiUtilMgd.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <!-- PnPDataObjects: PnPRowIdArray (LinkedList<int>) — vive en la raiz de AutoCAD -->
     <Reference Include="PnPDataObjects">
       <HintPath>C:\Program Files\Autodesk\AutoCAD 2026\PnPDataObjects.dll</HintPath>

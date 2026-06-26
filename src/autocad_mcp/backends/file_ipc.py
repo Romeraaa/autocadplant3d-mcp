@@ -278,6 +278,18 @@ class FileIPCBackend(AutoCADBackend):
                 {"pnpids": pnpids, "targets": targets, "zoom": zoom, "select": select},
             )
 
+    async def plant_pnid_probe(self, limit: int = 50) -> CommandResult:
+        """Run the P&ID diagnostic probe on the open drawing via the .NET plugin.
+
+        Inspects the active drawing for P&ID parts/lines without touching the
+        SQLite project. ``limit`` caps the number of sample rows/lines returned.
+
+        Payload on success: {pnid_part_found, dwg, row_count, by_class,
+        sample_rows, line_count, sample_lines, notes}.
+        """
+        async with self._lock:
+            return await self._dispatch_plant("pnid_probe", {"limit": limit})
+
     def _find_command_line_hwnd(self) -> int | None:
         """Find AutoCAD's MDIClient child window for command routing."""
         if sys.platform != "win32" or not self._hwnd:

@@ -169,6 +169,80 @@ namespace PlantMcpDispatch
         }
 
         /// <summary>
+        /// Resuelve el DataLinksManager de la parte P&ID del proyecto abierto.
+        /// La parte P&ID es el Project cuyo tipo de parte es PnId (su PartName
+        /// suele ser "PnId"). Devuelve null si no hay proyecto, no hay parte
+        /// P&ID o no expone DataLinksManager. No lanza: es tolerante por diseno
+        /// (el probe pnid_probe reporta pnid_part_found=false en ese caso).
+        /// </summary>
+        public static DataLinksManager? GetPnidDataLinksManager(out string? note)
+        {
+            note = null;
+            PlantProject? prj;
+            try
+            {
+                prj = PlantApplication.CurrentProject;
+            }
+            catch (System.Exception ex)
+            {
+                note = "No se pudo obtener el proyecto Plant 3D actual: " + ex.Message;
+                return null;
+            }
+
+            if (prj == null)
+            {
+                note = "No hay proyecto Plant 3D abierto en la sesion.";
+                return null;
+            }
+
+            try
+            {
+                ProjectPartCollection parts = prj.ProjectParts;
+                if (parts == null)
+                {
+                    note = "El proyecto no expone ProjectParts.";
+                    return null;
+                }
+
+                // Identificamos la parte P&ID por su PartName ("PnId"), comparado
+                // sin distinguir mayusculas. Es la via mas estable entre versiones;
+                // el tipo concreto (PnIdProject) vive en PnIdProjectPartsMgd y aqui
+                // basta con el nombre de parte para no acoplar el probe a ese tipo.
+                foreach (Project part in parts)
+                {
+                    string? partName = null;
+                    try { partName = part.PartName; } catch { /* parte sin PartName util */ }
+
+                    if (partName != null &&
+                        partName.IndexOf("PnId", System.StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        try
+                        {
+                            DataLinksManager dlm = part.DataLinksManager;
+                            if (dlm != null)
+                                return dlm;
+                            note = "La parte P&ID no expone DataLinksManager.";
+                            return null;
+                        }
+                        catch (System.Exception ex)
+                        {
+                            note = "Fallo al obtener el DataLinksManager de la parte P&ID: " + ex.Message;
+                            return null;
+                        }
+                    }
+                }
+
+                note = "El proyecto no contiene una parte P&ID (PnId).";
+                return null;
+            }
+            catch (System.Exception ex)
+            {
+                note = "Fallo recorriendo las partes del proyecto: " + ex.Message;
+                return null;
+            }
+        }
+
+        /// <summary>
         /// Obtiene los DataLinksManager de las partes del proyecto.
         /// </summary>
         private static List<DataLinksManager> GetDataLinksManagers(PlantProject prj)

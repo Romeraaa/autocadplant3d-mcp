@@ -78,6 +78,64 @@ namespace PlantMcpDispatch
         public long Handle { get; set; }
     }
 
+    /// <summary>Fila muestra del probe <c>pnid_probe</c>.</summary>
+    internal sealed class PnidSampleRow
+    {
+        [JsonPropertyName("rowid")]
+        public int RowId { get; set; }
+
+        [JsonPropertyName("class")]
+        public string Class { get; set; } = "";
+
+        [JsonPropertyName("tag")]
+        public string Tag { get; set; } = "";
+    }
+
+    /// <summary>Linea muestra del probe <c>pnid_probe</c>.</summary>
+    internal sealed class PnidSampleLine
+    {
+        [JsonPropertyName("group_id")]
+        public int GroupId { get; set; }
+
+        [JsonPropertyName("line_number")]
+        public string LineNumber { get; set; } = "";
+
+        [JsonPropertyName("service")]
+        public string Service { get; set; } = "";
+    }
+
+    /// <summary>
+    /// Payload del probe de diagnostico <c>pnid_probe</c>: vuelca lo que se ha
+    /// podido leer del P&ID activo. Tolerante: cualquier fallo parcial va a
+    /// <c>notes</c> y el resto se rellena con lo disponible.
+    /// </summary>
+    internal sealed class PnidProbePayload
+    {
+        [JsonPropertyName("pnid_part_found")]
+        public bool PnidPartFound { get; set; }
+
+        [JsonPropertyName("dwg")]
+        public string Dwg { get; set; } = "";
+
+        [JsonPropertyName("row_count")]
+        public int RowCount { get; set; }
+
+        [JsonPropertyName("by_class")]
+        public Dictionary<string, int> ByClass { get; set; } = new();
+
+        [JsonPropertyName("sample_rows")]
+        public List<PnidSampleRow> SampleRows { get; set; } = new();
+
+        [JsonPropertyName("line_count")]
+        public int LineCount { get; set; }
+
+        [JsonPropertyName("sample_lines")]
+        public List<PnidSampleLine> SampleLines { get; set; } = new();
+
+        [JsonPropertyName("notes")]
+        public List<string> Notes { get; set; } = new();
+    }
+
     /// <summary>Payload de la operacion <c>locate</c>.</summary>
     internal sealed class LocatePayload
     {

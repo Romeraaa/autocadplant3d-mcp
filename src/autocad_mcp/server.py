@@ -634,6 +634,14 @@ async def plant3d(
       plugin_status  — Comprueba que el plugin .NET responde (ping). Devuelve
                        {plugin, version, plant3d_available, project}. Requiere
                        AutoCAD abierto con el plugin cargado (NETLOAD).
+      pnid_probe     — DIAGNÓSTICO del plugin P&ID: inspecciona el dibujo
+                       activo (sin tocar los .dcf) y devuelve un resumen de las
+                       partes y líneas P&ID detectadas. Va por el plugin .NET,
+                       NO por SQLite: requiere AutoCAD 2026 abierto con el plugin
+                       PlantMcpDispatch cargado (NETLOAD).
+                       data: {limit?=50}
+                       Devuelve {pnid_part_found, dwg, row_count, by_class,
+                       sample_rows, line_count, sample_lines, notes}.
     """
     data = data or {}
     from autocad_mcp import plant3d_query
@@ -643,6 +651,8 @@ async def plant3d(
         return await _plant3d_locate(data)
     elif operation == "plugin_status":
         return await _plant3d_plugin_status()
+    elif operation == "pnid_probe":
+        return await _plant3d_pnid_probe(data)
 
     if operation == "list_projects":
         result = plant3d_query.list_projects(data.get("root"))
@@ -830,6 +840,16 @@ async def _plant3d_plugin_status() -> ToolResult:
     result = await backend.plant_ping()
     out = result.to_dict()
     out["operation"] = "plugin_status"
+    return _json(out)
+
+
+async def _plant3d_pnid_probe(data: dict) -> ToolResult:
+    """Run the P&ID diagnostic probe on the open drawing via the .NET plugin."""
+    backend = await _require_plant_plugin_backend()
+    limit = data.get("limit", 50)
+    result = await backend.plant_pnid_probe(limit)
+    out = result.to_dict()
+    out["operation"] = "pnid_probe"
     return _json(out)
 
 

@@ -7,6 +7,10 @@ using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.AutoCAD.EditorInput;
 using Autodesk.AutoCAD.Geometry;
 using Autodesk.AutoCAD.Runtime;
+using Autodesk.ProcessPower.DataLinks;
+using Autodesk.ProcessPower.DataObjects;
+using Autodesk.ProcessPower.PnIDObjects;
+using Autodesk.ProcessPower.PnIDGUIUtil;
 using AcadApp = Autodesk.AutoCAD.ApplicationServices.Application;
 
 [assembly: CommandClass(typeof(PlantMcpDispatch.DispatchCommand))]
@@ -85,6 +89,8 @@ namespace PlantMcpDispatch
                     return DoPing();
                 case "locate":
                     return DoLocate(cmd.Params);
+                case "pnid_probe":
+                    return DoPnidProbe(cmd.Params);
                 default:
                     throw new InvalidOperationException($"Comando no soportado: '{cmd.Command}'.");
             }
@@ -240,6 +246,179 @@ namespace PlantMcpDispatch
                 return payload;
 
             ApplySelectionAndZoom(doc, objectIds, select, zoom);
+            return payload;
+        }
+
+        // --------------------------------------------------------- pnid_probe
+        /// <summary>
+        /// Probe de diagnostico: lee el P&ID activo y vuelca filas, clases,
+        /// tags y lineas a JSON. NO es la herramienta final; es una sonda de
+        /// validacion en vivo. Tolerante por diseno: cualquier fallo parcial se
+        /// anota en 'notes' y el comando sigue devolviendo ok:true con lo leido.
+        /// Param opcional: { limit:int=50 } acota las muestras (no el conteo total).
+        /// </summary>
+        private static PnidProbePayload DoPnidProbe(JsonElement prms)
+        {
+            int limit = 50;
+            if (prms.ValueKind == JsonValueKind.Object &&
+                prms.TryGetProperty("limit", out JsonElement le))
+            {
+                if (le.ValueKind == JsonValueKind.Number && le.TryGetInt32(out int lv)) limit = lv;
+                else if (le.ValueKind == JsonValueKind.String && int.TryParse(le.GetString(), out int sv)) limit = sv;
+            }
+            if (limit < 0) limit = 0;
+
+            var payload = new PnidProbePayload();
+
+            // DWG activo (basename). No tumbar si no hay documento.
+            Database? activeDb = null;
+            try
+            {
+                Document? doc = AcadApp.DocumentManager.MdiActiveDocument;
+                if (doc != null)
+                {
+                    payload.Dwg = System.IO.Path.GetFileName(doc.Name) ?? "";
+                    activeDb = doc.Database;
+                }
+                else
+                {
+                    payload.Notes.Add("No hay documento activo en AutoCAD.");
+                }
+            }
+            catch (System.Exception ex)
+            {
+                payload.Notes.Add("No se pudo leer el documento activo: " + ex.Message);
+            }
+
+            // DataLinksManager de la parte P&ID.
+            DataLinksManager? dlm = Plant3dAccess.GetPnidDataLinksManager(out string? partNote);
+            if (dlm == null)
+            {
+                payload.PnidPartFound = false;
+                if (partNote != null) payload.Notes.Add(partNote);
+                return payload;
+            }
+            payload.PnidPartFound = true;
+
+            // --- Filas del DWG activo: conteo, agrupacion por clase y muestras ---
+            try
+            {
+                if (activeDb == null)
+                {
+                    payload.Notes.Add("Sin Database activa: no se pueden enumerar filas.");
+                }
+                else
+                {
+                    PnPRowIdArray rowIds = dlm.SelectAcPpRowIds(activeDb);
+                    if (rowIds != null)
+                    {
+                        foreach (int rowid in rowIds)
+                        {
+                            payload.RowCount++;
+
+                            // Clase del objeto (best-effort por fila).
+                            string cls = "(desconocida)";
+                            try
+                            {
+                                string? c = dlm.GetObjectClassname(rowid);
+                                if (!string.IsNullOrEmpty(c)) cls = c;
+                            }
+                            catch { /* clase no disponible para esta fila */ }
+
+                            payload.ByClass.TryGetValue(cls, out int n);
+                            payload.ByClass[cls] = n + 1;
+
+                            if (payload.SampleRows.Count < limit)
+                            {
+                                string tag = "";
+                                try
+                                {
+                                    // Preferimos TagUtil a adivinar el nombre de columna.
+                                    string? t = TagUtil.GetTagValue(dlm, rowid);
+                                    if (t != null) tag = t;
+                                }
+                                catch { /* sin tag para esta fila */ }
+
+                                payload.SampleRows.Add(new PnidSampleRow
+                                {
+                                    RowId = rowid,
+                                    Class = cls,
+                                    Tag = tag,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            catch (System.Exception ex)
+            {
+                payload.Notes.Add("Fallo enumerando filas (SelectAcPpRowIds): " + ex.Message);
+            }
+
+            // --- Lineas: LineGroupManager sobre todos los GroupType disponibles ---
+            try
+            {
+                var lgm = new LineGroupManager(dlm);
+
+                // GroupType es un enum; en lugar de adivinar el valor de "lineas de
+                // proceso", iteramos TODOS sus valores y acumulamos. Asi el probe
+                // reporta lo que haya sin acoplarse a un valor concreto del enum.
+                System.Array gtValues;
+                try
+                {
+                    gtValues = System.Enum.GetValues(typeof(GroupType));
+                }
+                catch (System.Exception ex)
+                {
+                    payload.Notes.Add("No se pudieron enumerar los GroupType: " + ex.Message);
+                    gtValues = System.Array.CreateInstance(typeof(GroupType), 0);
+                }
+
+                var seen = new HashSet<int>();
+                foreach (object gtObj in gtValues)
+                {
+                    GroupType gt = (GroupType)gtObj;
+                    PnPRowIdArray? groupIds;
+                    try
+                    {
+                        groupIds = lgm.GroupIds(gt);
+                    }
+                    catch (System.Exception ex)
+                    {
+                        payload.Notes.Add($"GroupIds({gt}) fallo: " + ex.Message);
+                        continue;
+                    }
+                    if (groupIds == null) continue;
+
+                    foreach (int gid in groupIds)
+                    {
+                        // Un mismo group_id podria aparecer en varios GroupType;
+                        // contamos cada uno una sola vez.
+                        if (!seen.Add(gid)) continue;
+                        payload.LineCount++;
+
+                        if (payload.SampleLines.Count < limit)
+                        {
+                            string lineNumber = "";
+                            string service = "";
+                            try { lineNumber = lgm.LineNumber(gid) ?? ""; } catch { }
+                            try { service = lgm.Service(gid) ?? ""; } catch { }
+
+                            payload.SampleLines.Add(new PnidSampleLine
+                            {
+                                GroupId = gid,
+                                LineNumber = lineNumber,
+                                Service = service,
+                            });
+                        }
+                    }
+                }
+            }
+            catch (System.Exception ex)
+            {
+                payload.Notes.Add("Fallo en LineGroupManager: " + ex.Message);
+            }
+
             return payload;
         }
 
