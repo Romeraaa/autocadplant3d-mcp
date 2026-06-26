@@ -1237,6 +1237,245 @@ def validate_specs(project: str, data: dict | None = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Spec catalogue listing / contents
+# ---------------------------------------------------------------------------
+
+
+def _used_spec_counts(piping_db: Path) -> dict[str, int] | None:
+    """Return ``{normalized_spec: component_count}`` from ``EngineeringItems``.
+
+    Counts how many components use each (non-empty) ``Spec`` value in the
+    project's ``Piping.dcf``. Returns ``None`` when the ``EngineeringItems``
+    table is missing, so callers can degrade gracefully. The mapping is keyed by
+    the original spec string (trimmed) so display keeps the catalogue casing.
+    """
+    con = _connect_ro(piping_db)
+    try:
+        cur = con.cursor()
+        try:
+            rows = cur.execute(
+                "SELECT Spec AS spec, COUNT(*) AS n FROM EngineeringItems "
+                "WHERE Spec IS NOT NULL AND TRIM(Spec) <> '' "
+                "GROUP BY Spec"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return None
+    finally:
+        con.close()
+    return {str(r["spec"]).strip(): int(r["n"]) for r in rows}
+
+
+def list_specs(project: str, data: dict | None = None) -> dict:
+    """List the piping specs of a Plant 3D project (used vs. catalogue).
+
+    Cross-references the specs actually *used* in the model
+    (``EngineeringItems.Spec`` in ``Piping.dcf``, with a per-spec component
+    count) against the specs *available* as ``.pspc`` catalogue files in the
+    ``Spec Sheets`` folder. Each entry reports:
+
+    * ``spec`` — spec name (the ``.pspc`` stem, or the used spec string).
+    * ``used`` — number of model components using the spec (0 if unused).
+    * ``has_pspc`` — whether a ``.pspc`` catalogue file exists for the spec.
+
+    Read-only: opens nothing for writing and never modifies the project.
+    Degrades gracefully when the ``Spec Sheets`` folder or the
+    ``EngineeringItems`` table is absent (those facets simply report empty,
+    with an explanatory note).
+    """
+    data = data or {}
+    project_dir = resolve_project_dir(project)
+    db = _db_path(project_dir, "Piping.dcf")
+
+    notes: list[str] = []
+
+    used = _used_spec_counts(db)
+    if used is None:
+        used = {}
+        notes.append(
+            "No se pudo leer EngineeringItems en Piping.dcf: el recuento de "
+            "uso por spec no está disponible."
+        )
+
+    stems = _spec_sheet_stems(project_dir)
+    if stems is None:
+        stems = set()
+        notes.append(
+            "La carpeta 'Spec Sheets' no existe en el proyecto: no hay "
+            "catálogo .pspc con el que cruzar las specs."
+        )
+
+    # Match used specs to catalogue stems case-insensitively, but keep a
+    # readable display name (prefer the catalogue stem casing when it exists).
+    stem_by_norm = {_norm(s): s for s in stems}
+    used_by_norm: dict[str, int] = {}
+    display_by_norm: dict[str, str] = {}
+    for spec_name, count in used.items():
+        n = _norm(spec_name)
+        used_by_norm[n] = used_by_norm.get(n, 0) + count
+        display_by_norm.setdefault(n, spec_name)
+    # Catalogue stems take precedence as the display name.
+    for n, stem in stem_by_norm.items():
+        display_by_norm[n] = stem
+
+    specs: list[dict] = []
+    for n in sorted(set(used_by_norm) | set(stem_by_norm), key=lambda k: display_by_norm[k].upper()):
+        specs.append(
+            {
+                "spec": display_by_norm[n],
+                "used": used_by_norm.get(n, 0),
+                "has_pspc": n in stem_by_norm,
+            }
+        )
+
+    return {
+        "ok": True,
+        "project": project_dir.name,
+        "path": str(project_dir),
+        "count": len(specs),
+        "specs": specs,
+        "notes": notes,
+    }
+
+
+# Component columns read from a .pspc EngineeringItems catalogue. Only the
+# columns that actually exist are selected (the schema varies a bit between
+# Metric/Imperial catalogues), the rest degrade to None.
+_PSPC_COMPONENT_COLS = (
+    "PartCategory",
+    "ShortDescription",
+    "NominalDiameter",
+    "NominalUnit",
+    "Schedule",
+    "Material",
+    "EndType",
+    "PressureClass",
+    "ItemCode",
+)
+
+
+def spec_contents(project: str, data: dict) -> dict:
+    """List the components allowed by a single spec's ``.pspc`` catalogue.
+
+    ``data`` must carry ``spec`` (the spec name; matched case-insensitively to a
+    ``.pspc`` stem in ``Spec Sheets``) and accepts ``limit`` (max components
+    returned; default 100, 0 = no cap — the number omitted is always reported).
+
+    Each component is read from the ``.pspc`` ``EngineeringItems`` table and
+    reported as ``{class, description, size, schedule, material, end_type,
+    pressure_class, item_code}`` (size formatted via :func:`_fmt_size`, keeping
+    the nominal unit). Read-only.
+
+    Returns ``ok: False`` (with a Spanish message) when no ``spec`` is given or
+    the spec has no ``.pspc`` file in the project's ``Spec Sheets`` folder.
+    """
+    data = data or {}
+    project_dir = resolve_project_dir(project)
+
+    spec_req = (data.get("spec") or "").strip()
+    if not spec_req:
+        return {
+            "ok": False,
+            "project": project_dir.name,
+            "spec": None,
+            "message": "Falta el nombre de la spec (data.spec).",
+        }
+
+    sheets_dir = project_dir / "Spec Sheets"
+    if not sheets_dir.is_dir():
+        return {
+            "ok": False,
+            "project": project_dir.name,
+            "spec": spec_req,
+            "message": (
+                "La carpeta 'Spec Sheets' no existe en el proyecto: no hay "
+                "catálogo .pspc que consultar."
+            ),
+        }
+
+    # Match the requested spec to a .pspc stem case-insensitively.
+    target_norm = _norm(spec_req)
+    pspc_path = next(
+        (p for p in sheets_dir.glob("*.pspc") if _norm(p.stem) == target_norm),
+        None,
+    )
+    if pspc_path is None:
+        return {
+            "ok": False,
+            "project": project_dir.name,
+            "spec": spec_req,
+            "message": (
+                f"La spec '{spec_req}' no tiene fichero .pspc en 'Spec Sheets'."
+            ),
+        }
+
+    limit = data.get("limit", 100)
+
+    con = _connect_ro(pspc_path)
+    try:
+        cur = con.cursor()
+        existing = {
+            row["name"]
+            for row in cur.execute("PRAGMA table_info(EngineeringItems)")
+        }
+        cols = [c for c in _PSPC_COMPONENT_COLS if c in existing]
+        if not cols:
+            return {
+                "ok": False,
+                "project": project_dir.name,
+                "spec": pspc_path.stem,
+                "path_pspc": str(pspc_path),
+                "message": (
+                    "El catálogo .pspc no tiene la tabla EngineeringItems con "
+                    "columnas de componente reconocibles."
+                ),
+            }
+        rows = cur.execute(
+            f"SELECT {', '.join(cols)} FROM EngineeringItems"
+        ).fetchall()
+    finally:
+        con.close()
+
+    def _get(r, col):
+        return r[col] if col in cols else None
+
+    components: list[dict] = []
+    for r in rows:
+        dia = _get(r, "NominalDiameter")
+        components.append(
+            {
+                "class": _get(r, "PartCategory"),
+                "description": _get(r, "ShortDescription"),
+                "size": _fmt_size(dia, _get(r, "NominalUnit")) if dia is not None else None,
+                "schedule": _get(r, "Schedule"),
+                "material": _get(r, "Material"),
+                "end_type": _get(r, "EndType"),
+                "pressure_class": _get(r, "PressureClass"),
+                "item_code": _get(r, "ItemCode"),
+            }
+        )
+
+    total = len(components)
+    shown, omitted = _capped(components, limit)
+
+    notes: list[str] = []
+    if omitted:
+        notes.append(
+            f"Se muestran {len(shown)} de {total} componentes "
+            f"({omitted} omitidos; usa limit=0 para todos)."
+        )
+
+    return {
+        "ok": True,
+        "project": project_dir.name,
+        "spec": pspc_path.stem,
+        "path_pspc": str(pspc_path),
+        "count": total,
+        "components": shown,
+        "notes": notes,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Line list (LINE LIST)
 # ---------------------------------------------------------------------------
 

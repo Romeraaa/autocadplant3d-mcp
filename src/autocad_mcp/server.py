@@ -556,6 +556,22 @@ async def plant3d(
                        líneas con specs mezcladas, specs vacías, specs sin
                        fichero .pspc, y Schedule/Material fuera del catálogo.
                        data: {project?, ignore_specs?, limit?}
+      list_specs     — Lista las specs de tubería del proyecto cruzando las
+                       USADAS en el modelo (EngineeringItems.Spec de Piping.dcf,
+                       con recuento de componentes) con las DISPONIBLES en
+                       catálogo (ficheros .pspc de 'Spec Sheets'). Cada spec con
+                       {spec, used (nº componentes), has_pspc}. Degrada con
+                       gracia si falta 'Spec Sheets' o EngineeringItems.
+                       data: {project?}
+                       Devuelve {ok, project, path, count, specs, notes}.
+      spec_contents  — Componentes PERMITIDOS por una spec: abre su .pspc en
+                       'Spec Sheets' (tabla EngineeringItems) y lista cada
+                       componente {class, description, size, schedule, material,
+                       end_type, pressure_class, item_code}. Solo lectura. Si la
+                       spec no tiene .pspc → ok:False con mensaje en español.
+                       data: {spec, project?, limit?=100 (0=sin tope)}
+                       Devuelve {ok, project, spec, path_pspc, count,
+                       components, notes}.
       list_lines     — LINE LIST: una fila por línea (LineNumberTag válido) con
                        nº de componentes, servicio/spec/tamaño nominal de la
                        cabecera, specs reales (y spec_mixed), tamaños por unidad,
@@ -702,6 +718,12 @@ async def plant3d(
     elif operation == "validate_specs":
         project = data.get("project") or await _detect_open_project()
         result = plant3d_query.validate_specs(project, data)
+    elif operation == "list_specs":
+        project = data.get("project") or await _detect_open_project()
+        result = plant3d_query.list_specs(project, data)
+    elif operation == "spec_contents":
+        project = data.get("project") or await _detect_open_project()
+        result = plant3d_query.spec_contents(project, data)
     elif operation == "list_lines":
         project = data.get("project") or await _detect_open_project()
         result = plant3d_query.list_lines(project, data)
