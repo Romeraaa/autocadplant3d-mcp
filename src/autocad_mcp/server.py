@@ -634,8 +634,16 @@ async def plant3d(
                        'line' (número de línea; PipeRunComponent). Como el plugin
                        filtra por el DWG activo, de una línea/tag multi-dibujo
                        solo se localizan los objetos del dibujo abierto.
+                       Con isolate?=True además AÍSLA los objetos localizados,
+                       ocultando el resto del modelo (devuelve isolated en el
+                       payload); revertir con la operación 'unisolate'.
                        data: {pnpids: [int] (o pnpid único) | tag | line,
-                       zoom?=True, select?=True, project?}
+                       zoom?=True, select?=True, isolate?=False, project?}
+      unisolate      — Revierte el aislado de 'locate' (vuelve a MOSTRAR todos
+                       los objetos del dibujo). Va por el plugin .NET, NO por
+                       SQLite: requiere AutoCAD 2026 abierto con el plugin
+                       PlantMcpDispatch cargado (NETLOAD).
+                       Devuelve {dwg, ok, notes}.
       plugin_status  — Comprueba que el plugin .NET responde (ping). Devuelve
                        {plugin, version, plant3d_available, project}. Requiere
                        AutoCAD abierto con el plugin cargado (NETLOAD).
@@ -654,6 +662,8 @@ async def plant3d(
     # --- Plugin .NET (File IPC, NO SQLite): locate / plugin_status ---
     if operation == "locate":
         return await _plant3d_locate(data)
+    elif operation == "unisolate":
+        return await _plant3d_unisolate(data)
     elif operation == "plugin_status":
         return await _plant3d_plugin_status()
     elif operation == "pnid_probe":
@@ -866,6 +876,7 @@ async def _plant3d_locate(data: dict) -> ToolResult:
 
     zoom = data.get("zoom", True)
     select = data.get("select", True)
+    isolate = bool(data.get("isolate", False))
 
     # Resolve each PnPID to its drawing handle(s) from the SQLite project DB,
     # so the plugin can grab objects by handle instead of relying on the
@@ -873,11 +884,20 @@ async def _plant3d_locate(data: dict) -> ToolResult:
     project = project or await _detect_open_project()
     targets = plant3d_query.resolve_handles(project, pnpids)
 
-    result = await backend.plant_locate(pnpids, targets, zoom, select)
+    result = await backend.plant_locate(pnpids, targets, zoom, select, isolate)
     out = result.to_dict()
     out["operation"] = "locate"
     if resolved_from is not None:
         out["resuelto_por"] = resolved_from
+    return _json(out)
+
+
+async def _plant3d_unisolate(data: dict) -> ToolResult:
+    """Revert object isolation in the drawing via the .NET plugin (show all)."""
+    backend = await _require_plant_plugin_backend()
+    result = await backend.plant_unisolate()
+    out = result.to_dict()
+    out["operation"] = "unisolate"
     return _json(out)
 
 

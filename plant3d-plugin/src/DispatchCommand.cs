@@ -89,6 +89,8 @@ namespace PlantMcpDispatch
                     return DoPing();
                 case "locate":
                     return DoLocate(cmd.Params);
+                case "unisolate":
+                    return DoUnisolate(cmd.Params);
                 case "pnid_probe":
                     return DoPnidProbe(cmd.Params);
                 default:
@@ -123,6 +125,7 @@ namespace PlantMcpDispatch
             var targets = new List<LocateTarget>();
             bool zoom = true;
             bool select = true;
+            bool isolate = false;
 
             if (prms.ValueKind == JsonValueKind.Object)
             {
@@ -173,6 +176,9 @@ namespace PlantMcpDispatch
                 if (prms.TryGetProperty("select", out JsonElement s) &&
                     (s.ValueKind == JsonValueKind.True || s.ValueKind == JsonValueKind.False))
                     select = s.GetBoolean();
+                if (prms.TryGetProperty("isolate", out JsonElement iso) &&
+                    (iso.ValueKind == JsonValueKind.True || iso.ValueKind == JsonValueKind.False))
+                    isolate = iso.GetBoolean();
             }
 
             Document doc = AcadApp.DocumentManager.MdiActiveDocument
@@ -224,7 +230,7 @@ namespace PlantMcpDispatch
                 if (objectIdsH.Count == 0)
                     return payload;
 
-                ApplySelectionAndZoom(doc, objectIdsH, select, zoom);
+                payload.Isolated = ApplySelectionAndZoom(doc, objectIdsH, select, zoom, isolate);
                 return payload;
             }
 
@@ -245,7 +251,45 @@ namespace PlantMcpDispatch
             if (objectIds.Count == 0)
                 return payload;
 
-            ApplySelectionAndZoom(doc, objectIds, select, zoom);
+            payload.Isolated = ApplySelectionAndZoom(doc, objectIds, select, zoom, isolate);
+            return payload;
+        }
+
+        // ----------------------------------------------------------- unisolate
+        /// <summary>
+        /// Revierte el aislado: muestra de nuevo todo lo oculto con el comando
+        /// nativo <c>UNISOLATEOBJECTS</c>. Best-effort: ok:true aunque no haya
+        /// documento activo o no hubiera nada aislado; las incidencias van a
+        /// 'notes'. Se ejecuta bajo DocumentLock (contexto de comando Modal).
+        /// </summary>
+        private static UnisolatePayload DoUnisolate(JsonElement prms)
+        {
+            var payload = new UnisolatePayload();
+
+            Document? doc = AcadApp.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+            {
+                payload.Notes.Add("No hay documento activo en AutoCAD: nada que revertir.");
+                return payload; // ok:true igualmente
+            }
+            payload.Dwg = doc.Name;
+
+            try
+            {
+                using (DocumentLock _ = doc.LockDocument())
+                {
+                    Editor ed = doc.Editor;
+                    // Comando nativo de objeto (no de capa). Muestra todo lo que
+                    // ISOLATEOBJECTS/HIDEOBJECTS hubieran ocultado en este DWG.
+                    ed.Command("_.UNISOLATEOBJECTS");
+                }
+            }
+            catch (System.Exception ex)
+            {
+                // Best-effort: no tumbamos el comando por un fallo del nativo.
+                payload.Notes.Add("UNISOLATEOBJECTS fallo: " + ex.Message);
+            }
+
             return payload;
         }
 
@@ -452,17 +496,36 @@ namespace PlantMcpDispatch
         }
 
         /// <summary>
-        /// Aplica seleccion implicita y/o zoom a los ObjectId resueltos, bajo
-        /// DocumentLock. Best-effort: nunca tumba locate.
+        /// Aplica aislado (opcional), seleccion implicita y/o zoom a los ObjectId
+        /// resueltos, bajo DocumentLock. Best-effort: nunca tumba locate.
+        /// Devuelve true si se aplico el aislado (ISOLATEOBJECTS) con exito.
         /// </summary>
-        private static void ApplySelectionAndZoom(Document doc, List<ObjectId> objectIds, bool select, bool zoom)
+        private static bool ApplySelectionAndZoom(Document doc, List<ObjectId> objectIds, bool select, bool zoom, bool isolate)
         {
+            bool isolated = false;
 
             // Bloquear el documento para operar sobre el (estamos en contexto de comando).
             using (DocumentLock _ = doc.LockDocument())
             {
                 Editor ed = doc.Editor;
                 ObjectId[] idArray = objectIds.ToArray();
+
+                // AISLAR primero: ocultamos todo lo demas y luego el ZOOM _Object
+                // encuadra lo que queda visible. Best-effort: si falla, no tumba
+                // locate (seguimos con zoom/seleccion sobre el dibujo completo).
+                if (isolate)
+                {
+                    try
+                    {
+                        SelectionSet ss = SelectionSet.FromObjectIds(idArray);
+                        ed.Command("_.ISOLATEOBJECTS", ss, "");
+                        isolated = true;
+                    }
+                    catch
+                    {
+                        // El aislado es best-effort; no debe tumbar locate.
+                    }
+                }
 
                 // ZOOM primero, SELECCION despues: el comando ZOOM _Object consume
                 // la seleccion que recibe y deja la linea de comandos limpia; si
@@ -492,6 +555,8 @@ namespace PlantMcpDispatch
                     }
                 }
             }
+
+            return isolated;
         }
 
         /// <summary>

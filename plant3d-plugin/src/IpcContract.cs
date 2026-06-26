@@ -153,5 +153,26 @@ namespace PlantMcpDispatch
 
         [JsonPropertyName("dwg")]
         public string? Dwg { get; set; }
+
+        // true si se aplico el aislado de objetos (ISOLATEOBJECTS) en este locate.
+        [JsonPropertyName("isolated")]
+        public bool Isolated { get; set; }
+    }
+
+    /// <summary>
+    /// Payload del comando <c>unisolate</c>: revierte el aislado mostrando todo
+    /// lo oculto (UNISOLATEOBJECTS). Best-effort: ok:true aunque no haya nada que
+    /// revertir o falte documento activo; las incidencias van en notes.
+    /// </summary>
+    internal sealed class UnisolatePayload
+    {
+        [JsonPropertyName("dwg")]
+        public string? Dwg { get; set; }
+
+        [JsonPropertyName("ok")]
+        public bool Ok { get; set; } = true;
+
+        [JsonPropertyName("notes")]
+        public List<string> Notes { get; set; } = new();
     }
 }

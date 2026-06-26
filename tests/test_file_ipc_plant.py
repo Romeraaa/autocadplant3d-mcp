@@ -170,6 +170,54 @@ class TestPlantLocate:
         assert captured["cmd"]["params"]["select"] is True
         assert captured["cmd"]["params"]["targets"] == []
 
+    @pytest.mark.asyncio
+    async def test_locate_sends_isolate_true(self, tmp_path):
+        backend = _make_backend(tmp_path)
+        captured: dict = {}
+        backend._type_dispatch_trigger = _patch_trigger_and_write_result(
+            backend, {"found_count": 1, "isolated": True}, captured
+        )
+
+        with patch("autocad_mcp.backends.file_ipc.TIMEOUT", 2.0):
+            await backend.plant_locate([5], [], isolate=True)
+
+        assert captured["cmd"]["params"]["isolate"] is True
+
+    @pytest.mark.asyncio
+    async def test_locate_isolate_defaults_false(self, tmp_path):
+        backend = _make_backend(tmp_path)
+        captured: dict = {}
+        backend._type_dispatch_trigger = _patch_trigger_and_write_result(
+            backend, {"found_count": 1}, captured
+        )
+
+        with patch("autocad_mcp.backends.file_ipc.TIMEOUT", 2.0):
+            await backend.plant_locate([5], [])
+
+        assert captured["cmd"]["params"]["isolate"] is False
+
+
+class TestPlantUnisolate:
+    @pytest.mark.asyncio
+    async def test_unisolate_writes_unisolate_command(self, tmp_path):
+        backend = _make_backend(tmp_path)
+        captured: dict = {}
+        payload = {"dwg": "model.dwg", "ok": True, "notes": []}
+        backend._type_dispatch_trigger = _patch_trigger_and_write_result(
+            backend, payload, captured
+        )
+
+        with patch("autocad_mcp.backends.file_ipc.TIMEOUT", 2.0):
+            result = await backend.plant_unisolate()
+
+        assert result.ok is True
+        assert result.payload == payload
+        assert captured["trigger"] == "MCPPLANTDISPATCH"
+        assert captured["cmd_path"].name.startswith("autocad_mcp_plant_cmd_")
+        assert captured["cmd"]["command"] == "unisolate"
+        assert captured["cmd"]["params"] == {}
+
+
 class TestPlantPnidProbe:
     @pytest.mark.asyncio
     async def test_pnid_probe_writes_cmd_with_limit(self, tmp_path):
@@ -268,16 +316,24 @@ class _FakeBackend:
         self.name = name
         self.last_targets = None
 
-    async def plant_locate(self, pnpids, targets, zoom=True, select=True):
+    async def plant_locate(
+        self, pnpids, targets, zoom=True, select=True, isolate=False
+    ):
         self.last_targets = targets
+        self.last_isolate = isolate
         return CommandResult(
             ok=True,
             payload={
                 "requested": pnpids,
                 "found_count": len(pnpids),
                 "targets": targets,
+                "isolated": isolate,
             },
         )
+
+    async def plant_unisolate(self):
+        self.unisolate_called = True
+        return CommandResult(ok=True, payload={"dwg": "model.dwg", "ok": True, "notes": []})
 
     async def plant_ping(self):
         return CommandResult(ok=True, payload={"plugin": "PlantMcpDispatch"})
@@ -405,6 +461,32 @@ class TestServerLocateRouting:
         assert parsed["ok"] is True
         # El FakeBackend devuelve los targets que recibió en el payload.
         assert parsed["payload"]["targets"] == targets
+
+    @pytest.mark.asyncio
+    async def test_locate_isolate_flag_propagated(self):
+        """isolate:true en data llega al backend y se refleja en el payload."""
+        from autocad_mcp import server
+
+        with _patch_backend("file_ipc"):
+            out = await server.plant3d(
+                operation="locate", data={"pnpids": [1], "isolate": True}
+            )
+
+        parsed = json.loads(out)
+        assert parsed["ok"] is True
+        # El FakeBackend devuelve isolated == el flag recibido.
+        assert parsed["payload"]["isolated"] is True
+
+    @pytest.mark.asyncio
+    async def test_locate_isolate_default_false(self):
+        from autocad_mcp import server
+
+        with _patch_backend("file_ipc"):
+            out = await server.plant3d(operation="locate", data={"pnpids": [1]})
+
+        parsed = json.loads(out)
+        assert parsed["ok"] is True
+        assert parsed["payload"]["isolated"] is False
 
     @pytest.mark.asyncio
     async def test_plugin_status_non_file_ipc_clear_error(self):
@@ -544,6 +626,31 @@ class TestServerPnidProbeRouting:
         parsed = json.loads(out)
         assert parsed["ok"] is True
         assert parsed["payload"]["limit"] == 7
+
+
+class TestServerUnisolateRouting:
+    @pytest.mark.asyncio
+    async def test_unisolate_non_file_ipc_clear_error(self):
+        from autocad_mcp import server
+
+        with _patch_backend("ezdxf"):
+            out = await server.plant3d(operation="unisolate", data={})
+
+        parsed = json.loads(out)
+        assert "PlantMcpDispatch" in parsed["error"]
+        assert "NETLOAD" in parsed["error"]
+
+    @pytest.mark.asyncio
+    async def test_unisolate_on_file_ipc_calls_backend(self):
+        from autocad_mcp import server
+
+        with _patch_backend("file_ipc"):
+            out = await server.plant3d(operation="unisolate", data={})
+
+        parsed = json.loads(out)
+        assert parsed["ok"] is True
+        assert parsed["operation"] == "unisolate"
+        assert parsed["payload"]["ok"] is True
 
 
 # ---------------------------------------------------------------------------

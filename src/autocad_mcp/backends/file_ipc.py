@@ -262,21 +262,45 @@ class FileIPCBackend(AutoCADBackend):
             return await self._dispatch_plant("ping", {})
 
     async def plant_locate(
-        self, pnpids, targets, zoom: bool = True, select: bool = True
+        self,
+        pnpids,
+        targets,
+        zoom: bool = True,
+        select: bool = True,
+        isolate: bool = False,
     ) -> CommandResult:
         """Locate Plant 3D objects in the open drawing via the .NET plugin.
 
         ``targets`` carries the pre-resolved drawing handles
         (``[{"pnpid", "dwg", "handle"}, ...]``) so the plugin grabs objects by
         handle. ``pnpids`` is still sent for the requested/found/not_found counts.
+        When ``isolate`` is true the plugin also isolates the located objects
+        (hiding the rest) and reports ``isolated`` in its payload.
 
-        Payload on success: {requested, found, not_found, found_count, dwg}.
+        Payload on success: {requested, found, not_found, found_count, dwg,
+        isolated}.
         """
         async with self._lock:
             return await self._dispatch_plant(
                 "locate",
-                {"pnpids": pnpids, "targets": targets, "zoom": zoom, "select": select},
+                {
+                    "pnpids": pnpids,
+                    "targets": targets,
+                    "zoom": zoom,
+                    "select": select,
+                    "isolate": isolate,
+                },
             )
+
+    async def plant_unisolate(self) -> CommandResult:
+        """Revert object isolation in the open drawing via the .NET plugin.
+
+        Shows every object again (undoes a previous ``plant_locate`` isolate).
+
+        Payload on success: {dwg, ok, notes}.
+        """
+        async with self._lock:
+            return await self._dispatch_plant("unisolate", {})
 
     async def plant_pnid_probe(self, limit: int = 50) -> CommandResult:
         """Run the P&ID diagnostic probe on the open drawing via the .NET plugin.
