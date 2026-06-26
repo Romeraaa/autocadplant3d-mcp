@@ -3396,3 +3396,407 @@ def bolt_gasket_list(project: str, data: dict | None = None) -> dict:
         "groups": capped,
         "notes": notes,
     }
+
+
+# ---------------------------------------------------------------------------
+# Equipment listing & full component dump
+# ---------------------------------------------------------------------------
+
+# Internal PnP bookkeeping columns that pollute a full property dump without
+# adding engineering value. Kept conservative: we only drop GUID/timestamp/
+# status/revision noise; everything else (sizes, specs, materials...) survives.
+_INTERNAL_PROP_COLS = frozenset(
+    {
+        "PnPGuid",
+        "PnPTimestamp",
+        "PnPTimestampGuid",
+        "PnPStatus",
+        "PnPRevision",
+        "PnPParentGuid",
+    }
+)
+
+
+def _equipment_dwgs(con: sqlite3.Connection, pnpids: list[int]) -> dict[int, list[dict]]:
+    """Map each PnPID to its [{dwg, handle}] via PnPDataLinks ⋈ PnPDrawings.
+
+    ``PnPDataLinks.RowId`` is the object's own PnPID; ``DwgId`` joins to
+    ``PnPDrawings.PnPID`` for the drawing name and the handle is rebuilt as
+    ``(high << 32) | (low & 0xFFFFFFFF)`` (same rule as :func:`resolve_handles`).
+    Tolerant: missing tables/columns or rows yield an empty mapping/list.
+    """
+    if not pnpids:
+        return {}
+    placeholders = ",".join("?" for _ in pnpids)
+    try:
+        rows = con.execute(
+            f"""
+            SELECT dl.RowId         AS pnpid,
+                   dl.DwgHandleLow  AS low,
+                   dl.DwgHandleHigh AS high,
+                   dr."Dwg Name"    AS dwg
+            FROM PnPDataLinks dl
+            JOIN PnPDrawings dr ON dr.PnPID = dl.DwgId
+            WHERE dl.RowId IN ({placeholders})
+            """,
+            [int(p) for p in pnpids],
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+
+    out: dict[int, list[dict]] = {}
+    seen: set[tuple[int, str, int]] = set()
+    for r in rows:
+        dwg = _as_text(r["dwg"])
+        low = r["low"]
+        if not dwg or low is None:
+            continue
+        high = r["high"] or 0
+        handle = (int(high) << 32) | (int(low) & 0xFFFFFFFF)
+        pid = int(r["pnpid"])
+        key = (pid, dwg, handle)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.setdefault(pid, []).append({"dwg": dwg, "handle": handle})
+    return out
+
+
+def list_equipment(project: str, data: dict | None = None) -> dict:
+    """List the equipment of a Plant 3D project (read-only, Piping.dcf SQLite).
+
+    The ``Equipment`` table already holds every equipment item (pumps, misc
+    equipment, heat exchangers, ...) with its ``Tag``/``Number``/``Type``/``Area``;
+    the *real* class lives in ``PnPBase.PnPClassName`` (e.g. Pump, MiscEquipment,
+    HeatExchanger). Each equipment may own several nozzles, related through
+    ``AssetOwnership`` (``Owner`` = equipment PnPID, ``Owned`` = nozzle PnPID).
+
+    For each equipment we return ``{pnpid, class, tag, type, number, area,
+    nozzle_count}`` plus a ``nozzles`` list (PnPIDs) — cheap to compute, so it is
+    always included. The response also carries ``count`` and ``by_class``.
+
+    Tolerant by design: a missing table/column degrades gracefully (the affected
+    field is omitted/zeroed and a Spanish note is added) instead of raising. The
+    database is opened strictly read-only and never modified.
+
+    data: ``{project?}`` (no other options yet).
+    """
+    project_dir = resolve_project_dir(project)
+    db = _db_path(project_dir, "Piping.dcf")
+    notes: list[str] = []
+
+    con = _connect_ro(db)
+    try:
+        if not _table_exists(con, "Equipment"):
+            return {
+                "ok": True,
+                "project": project_dir.name,
+                "path": str(project_dir),
+                "count": 0,
+                "by_class": {},
+                "equipment": [],
+                "notes": [
+                    "El proyecto no tiene tabla Equipment en Piping.dcf; "
+                    "no hay equipos que listar."
+                ],
+            }
+
+        eq_cols = _table_columns(con, "Equipment")
+        # Selecciona solo las columnas presentes (esquema variable entre proyectos).
+        wanted = [c for c in ("PnPID", "Tag", "Number", "Type", "Area") if c in eq_cols]
+        if "PnPID" not in wanted:
+            return {
+                "ok": False,
+                "project": project_dir.name,
+                "path": str(project_dir),
+                "count": 0,
+                "by_class": {},
+                "equipment": [],
+                "notes": [
+                    "La tabla Equipment no tiene columna PnPID; esquema inesperado."
+                ],
+            }
+        select_cols = ", ".join(f'"{c}"' for c in wanted)
+        eq_rows = con.execute(f"SELECT {select_cols} FROM Equipment").fetchall()
+
+        pnpids = [int(r["PnPID"]) for r in eq_rows if r["PnPID"] is not None]
+
+        # Clase real desde PnPBase (PnPClassName).
+        class_by_pid: dict[int, str | None] = {}
+        if _table_exists(con, "PnPBase") and pnpids:
+            placeholders = ",".join("?" for _ in pnpids)
+            try:
+                for r in con.execute(
+                    f"SELECT PnPID, PnPClassName FROM PnPBase "
+                    f"WHERE PnPID IN ({placeholders})",
+                    pnpids,
+                ).fetchall():
+                    class_by_pid[int(r["PnPID"])] = _as_text(r["PnPClassName"])
+            except sqlite3.OperationalError:
+                notes.append(
+                    "No se pudo leer PnPBase.PnPClassName; la clase de los "
+                    "equipos quedará vacía."
+                )
+        else:
+            notes.append(
+                "Sin tabla PnPBase: no se puede determinar la clase de los equipos."
+            )
+
+        # Nozzles por equipo vía AssetOwnership (Owner=equipo, Owned=nozzle).
+        nozzles_by_pid: dict[int, list[int]] = {}
+        if _table_exists(con, "AssetOwnership") and pnpids:
+            ao_cols = _table_columns(con, "AssetOwnership")
+            if {"Owner", "Owned"} <= ao_cols:
+                # Restringe Owned a la tabla Nozzle si existe (un equipo puede
+                # "poseer" otras cosas); si no, acepta cualquier Owned.
+                has_nozzle = _table_exists(con, "Nozzle")
+                placeholders = ",".join("?" for _ in pnpids)
+                nozzle_filter = (
+                    "AND Owned IN (SELECT PnPID FROM Nozzle)" if has_nozzle else ""
+                )
+                try:
+                    for r in con.execute(
+                        f"SELECT Owner, Owned FROM AssetOwnership "
+                        f"WHERE Owner IN ({placeholders}) {nozzle_filter}",
+                        pnpids,
+                    ).fetchall():
+                        if r["Owner"] is None or r["Owned"] is None:
+                            continue
+                        nozzles_by_pid.setdefault(int(r["Owner"]), []).append(
+                            int(r["Owned"])
+                        )
+                except sqlite3.OperationalError:
+                    notes.append(
+                        "No se pudo leer AssetOwnership; el recuento de boquillas "
+                        "(nozzles) quedará a 0."
+                    )
+            else:
+                notes.append(
+                    "AssetOwnership sin columnas Owner/Owned; sin recuento de "
+                    "boquillas."
+                )
+        else:
+            notes.append(
+                "Sin tabla AssetOwnership: no se pueden asociar boquillas a "
+                "los equipos (nozzle_count = 0)."
+            )
+
+        equipment: list[dict] = []
+        by_class: dict[str, int] = {}
+        for r in eq_rows:
+            if r["PnPID"] is None:
+                continue
+            pid = int(r["PnPID"])
+            klass = class_by_pid.get(pid)
+            nozzles = sorted(nozzles_by_pid.get(pid, []))
+            item = {
+                "pnpid": pid,
+                "class": klass,
+                "tag": _as_text(r["Tag"]) if "Tag" in wanted else None,
+                "type": _as_text(r["Type"]) if "Type" in wanted else None,
+                "number": _as_text(r["Number"]) if "Number" in wanted else None,
+                "area": _as_text(r["Area"]) if "Area" in wanted else None,
+                "nozzle_count": len(nozzles),
+                "nozzles": nozzles,
+            }
+            equipment.append(item)
+            key = klass or "(sin clase)"
+            by_class[key] = by_class.get(key, 0) + 1
+
+        # Orden estable: por tag (vacíos al final), luego pnpid.
+        equipment.sort(key=lambda e: ((e["tag"] or "￿").upper(), e["pnpid"]))
+
+        by_class_sorted = dict(
+            sorted(by_class.items(), key=lambda kv: (-kv[1], kv[0]))
+        )
+
+        notes.append(
+            "Clase real tomada de PnPBase.PnPClassName; la tabla Equipment "
+            "agrupa pumps/misc/heat exchangers con su Tag/Type/Number/Area."
+        )
+        notes.append(
+            "Las boquillas (nozzles) se relacionan vía AssetOwnership "
+            "(Owner=equipo, Owned=nozzle)."
+        )
+        notes.append(
+            "No localiza el objeto en el dibujo (sin handle aquí; usa "
+            "get_component o el plugin .NET 'locate')."
+        )
+
+        return {
+            "ok": True,
+            "project": project_dir.name,
+            "path": str(project_dir),
+            "count": len(equipment),
+            "by_class": by_class_sorted,
+            "equipment": equipment,
+            "notes": notes,
+        }
+    finally:
+        con.close()
+
+
+def get_component(project: str, data: dict) -> dict:
+    """Full property dump of ONE Plant 3D object (read-only, Piping.dcf SQLite).
+
+    The object is identified by ``data["pnpid"]`` (int). Alternatively a
+    ``data["tag"]`` is accepted and resolved with :func:`pnpids_for_tag`
+    (PnPTagRegistry); if the tag maps to several objects the first is used and a
+    Spanish note flags the ambiguity.
+
+    The class is read from ``PnPBase.PnPClassName``; then every column of the
+    object's row in its class table is dumped, merged with its row in
+    ``EngineeringItems`` (common engineering properties) when present. Internal
+    bookkeeping columns (GUID/timestamp/status/revision) are dropped; everything
+    useful is kept. When available, the object's drawing(s) and handle(s) are
+    resolved via ``PnPDataLinks`` ⋈ ``PnPDrawings`` so it can later be located
+    with the .NET ``locate``.
+
+    Returns ``{ok, project, pnpid, class, properties:{...}, dwgs:[{dwg, handle}],
+    notes}``. If the PnPID does not exist, ``{ok: False, ...}`` with a Spanish
+    message. The database is opened strictly read-only and never modified.
+    """
+    data = data or {}
+    project_dir = resolve_project_dir(project)
+    db = _db_path(project_dir, "Piping.dcf")
+    notes: list[str] = []
+
+    # --- resolver el PnPID (directo o vía tag) ------------------------------
+    pnpid = data.get("pnpid")
+    tag = data.get("tag")
+    if pnpid is None and tag:
+        matches = pnpids_for_tag(project, str(tag))
+        if not matches:
+            return {
+                "ok": False,
+                "project": project_dir.name,
+                "path": str(project_dir),
+                "pnpid": None,
+                "class": None,
+                "properties": {},
+                "dwgs": [],
+                "notes": [
+                    f"El tag '{tag}' no se encontró en el proyecto "
+                    "(PnPTagRegistry/Equipment)."
+                ],
+            }
+        pnpid = matches[0]
+        if len(matches) > 1:
+            notes.append(
+                f"El tag '{tag}' resuelve a {len(matches)} objetos "
+                f"{matches}; se devuelve el primero (PnPID {pnpid})."
+            )
+    if pnpid is None:
+        return {
+            "ok": False,
+            "project": project_dir.name,
+            "path": str(project_dir),
+            "pnpid": None,
+            "class": None,
+            "properties": {},
+            "dwgs": [],
+            "notes": ["Indica data['pnpid'] (entero) o data['tag']."],
+        }
+    try:
+        pnpid = int(pnpid)
+    except (TypeError, ValueError):
+        return {
+            "ok": False,
+            "project": project_dir.name,
+            "path": str(project_dir),
+            "pnpid": data.get("pnpid"),
+            "class": None,
+            "properties": {},
+            "dwgs": [],
+            "notes": ["data['pnpid'] debe ser un entero."],
+        }
+
+    con = _connect_ro(db)
+    try:
+        # --- clase desde PnPBase --------------------------------------------
+        klass: str | None = None
+        if _table_exists(con, "PnPBase"):
+            row = con.execute(
+                "SELECT PnPClassName FROM PnPBase WHERE PnPID = ?", (pnpid,)
+            ).fetchone()
+            if row is None:
+                return {
+                    "ok": False,
+                    "project": project_dir.name,
+                    "path": str(project_dir),
+                    "pnpid": pnpid,
+                    "class": None,
+                    "properties": {},
+                    "dwgs": [],
+                    "notes": [f"No existe ningún objeto con PnPID {pnpid}."],
+                }
+            klass = _as_text(row["PnPClassName"])
+        else:
+            notes.append(
+                "Sin tabla PnPBase: no se puede determinar la clase del objeto."
+            )
+
+        properties: dict = {}
+
+        def _merge_row(table: str) -> bool:
+            """Vuelca la fila del PnPID en ``table`` sobre properties. True si la hubo."""
+            if not table or not _table_exists(con, table):
+                return False
+            cols = _table_columns(con, table)
+            if "PnPID" not in cols:
+                return False
+            r = con.execute(
+                f'SELECT * FROM "{table}" WHERE PnPID = ?', (pnpid,)
+            ).fetchone()
+            if r is None:
+                return False
+            for col in r.keys():
+                if col in _INTERNAL_PROP_COLS or col == "PnPID":
+                    continue
+                val = r[col]
+                properties[col] = (
+                    _as_text(val) if isinstance(val, (bytes, bytearray)) else val
+                )
+            return True
+
+        # Tabla de clase (p.ej. Equipment, Valve, Pipe...).
+        had_class_row = _merge_row(klass) if klass else False
+        if klass and not had_class_row:
+            notes.append(
+                f"No hay fila en la tabla de clase '{klass}' para PnPID {pnpid}."
+            )
+
+        # Propiedades comunes de ingeniería.
+        had_ei = _merge_row("EngineeringItems")
+        if had_ei:
+            notes.append(
+                "Propiedades fusionadas: tabla de clase + EngineeringItems "
+                "(propiedades comunes de ingeniería)."
+            )
+
+        if not properties:
+            notes.append(
+                "No se hallaron propiedades en tablas de clase/EngineeringItems "
+                "para este PnPID."
+            )
+
+        # --- DWG(s) y handle(s) ---------------------------------------------
+        dwgs = _equipment_dwgs(con, [pnpid]).get(pnpid, [])
+        if not dwgs:
+            notes.append(
+                "Sin DWG/handle en PnPDataLinks para este objeto (puede no tener "
+                "representación gráfica indexada)."
+            )
+
+        return {
+            "ok": True,
+            "project": project_dir.name,
+            "path": str(project_dir),
+            "pnpid": pnpid,
+            "class": klass,
+            "properties": properties,
+            "dwgs": dwgs,
+            "notes": notes,
+        }
+    finally:
+        con.close()

@@ -615,6 +615,25 @@ async def plant3d(
                        (untagged). Aquí limit acota el nº de grupos.
                        data: {project?, group_by?, line?, spec?, size?,
                        shop_field?, item_type?, limit?}
+      list_equipment — Lista los equipos del proyecto (tabla Equipment de
+                       Piping.dcf: bombas, equipo misceláneo, intercambiadores,
+                       etc.). La clase real se toma de PnPBase.PnPClassName y las
+                       boquillas (nozzles) se asocian vía AssetOwnership
+                       (Owner=equipo, Owned=nozzle). Cada equipo con pnpid,
+                       class, tag, type, number, area, nozzle_count y nozzles.
+                       Solo lectura; degrada con gracia si falta una tabla.
+                       data: {project?}
+                       Devuelve {ok, project, count, by_class, equipment, notes}.
+      get_component  — Volcado COMPLETO de propiedades de UN objeto Plant 3D por
+                       pnpid (entero) o por tag (PnPTagRegistry; si resuelve a
+                       varios, devuelve el primero y avisa). La clase se lee de
+                       PnPBase.PnPClassName; vuelca todas las columnas de su tabla
+                       de clase + EngineeringItems (omite GUID/timestamp). Incluye
+                       DWG(s) y handle(s) vía PnPDataLinks⋈PnPDrawings (para
+                       localizar luego con 'locate'). Solo lectura.
+                       data: {pnpid | tag, project?}
+                       Devuelve {ok, project, pnpid, class, properties, dwgs,
+                       notes}; pnpid inexistente → ok:False.
       list_projects  — Lista proyectos bajo una raíz. data: {root?}
                        (usa AUTOCAD_MCP_PLANT3D_ROOT si no se indica root)
       list_drawings  — Lista y clasifica los dibujos del proyecto (PnPDrawings
@@ -714,6 +733,12 @@ async def plant3d(
     elif operation == "bolt_gasket_list":
         project = data.get("project") or await _detect_open_project()
         result = plant3d_query.bolt_gasket_list(project, data)
+    elif operation == "list_equipment":
+        project = data.get("project") or await _detect_open_project()
+        result = plant3d_query.list_equipment(project, data)
+    elif operation == "get_component":
+        project = data.get("project") or await _detect_open_project()
+        result = plant3d_query.get_component(project, data)
     else:
         return _json({"error": f"Unknown plant3d operation: {operation}"})
 

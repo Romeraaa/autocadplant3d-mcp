@@ -154,10 +154,24 @@ requieren el plugin .NET y nunca modifican el proyecto (apertura `mode=ro`). **E
 ## Operaciones vía plugin .NET (NO SQLite)
 
 - `locate` — **EXCEPCION: va por el plugin .NET, NO por SQLite.** Localiza objetos Plant 3D en
-  el DWG abierto por su `PnPID` y los resalta/encuadra (select + zoom).
+  el DWG abierto y los resalta/encuadra (select + zoom). Admite tres modos de búsqueda con
+  precedencia **pnpids > tag > line**.
 
   **Admite el parámetro `project`** (igual que el resto de operaciones plant3d): si se omite,
   detecta el proyecto del dibujo activo subiendo desde `DWGPREFIX` hasta `Project.xml`.
+
+  **Modos de búsqueda:**
+
+  - `pnpids` — lista de PnPIDs numéricos (o PnPID único; acepta strings numéricas coercionadas
+    a int; rechaza no convertibles y bool con error en español). Modo más directo.
+  - `tag` — tag de equipo o instrumento (string). Resuelve a PnPIDs siguiendo:
+    `PnPTagRegistry.Tag`→`RowId` (búsqueda principal); si no encuentra, fallback a
+    `Equipment.Tag`. El conjunto de PnPIDs resultante se reenvía al plugin.
+  - `line` — número de línea (string, p.ej. `"10\"-609001OG010-A01SC1SX"`). Resuelve a
+    PnPIDs vía `PipeRunComponent.LineNumberTag`→`PnPID`. Los PnPIDs se reenvían al plugin;
+    si el DWG activo no contiene ninguno, `found=0` es la respuesta correcta (el filtrado
+    por DWG activo es por diseño). Validado: línea real con 206 PnPIDs → `found=0` porque
+    esa línea no estaba en el DWG `R9` abierto.
 
   **Flujo de resolución (vía HANDLE — vía principal):**
   Python llama a `plant3d_query.resolve_handles(project, pnpids)`, que lee `Piping.dcf`
@@ -171,17 +185,44 @@ requieren el plugin .NET y nunca modifican el proyecto (apertura `mode=ro`). **E
   DWG activo van a `not_found` (existen en el proyecto, pero en otro modelo).
   El enfoque antiguo (`SelectAcPpObjectIds`/`MakeAcDbObjectIds`) se conserva como fallback.
 
-  Parámetros: `data={"pnpids": [int]}` (o `pnpid` único; acepta strings numéricas coercionadas
-  a int; rechaza no convertibles y bool con error en español), `project` (opcional),
-  `zoom?=True`, `select?=True`.
+  **Parámetros:**
+  - `data={"pnpids": [int]}` — modo pnpids (ver modos de búsqueda)
+  - `data={"tag": str}` — modo tag
+  - `data={"line": str}` — modo línea
+  - `project` (opcional)
+  - `zoom?=True`, `select?=True`
+  - `isolate?=False` — si `True`, tras localizar los objetos ejecuta `ISOLATEOBJECTS` para
+    ocultar todo lo demás y dejar visibles solo los objetos encontrados. Validado en vivo:
+    sobre válvula PnPID 200293 dejó visible solo la válvula en el modelo 3D.
+
   Payload: `{requested, found, not_found, found_count, dwg}`.
   Requiere AutoCAD 2026 abierto con el plugin cargado (NETLOAD) y el DWG del modelo
   correspondiente abierto; sobre `ezdxf`/headless devuelve error en español.
 
-  **VALIDADO EN VIVO** (2026-06-25) con el proyecto `23099 - AIR LIQUIDE HUELVA`
-  (DWG `23099-PIP-MOD-0001_R9.dwg`): válvulas PnPID 200171 / 200275 / 200293 localizadas y
-  encuadradas correctamente en vista 3D. Tests unitarios: 28 (suite 1092 verdes).
-  Commits: `b1897a5` (base) + edits del enfoque HANDLE (misma sesión, 2026-06-25).
+  **PRECAUCION — `view.get_screenshot` tras isolate/unisolate:** el tool devuelve capturas en
+  negro (byte-idénticas, falso negativo) después de un cambio de visibilidad por isolate. No
+  refleja el estado real de AutoCAD. Confirmar el resultado del isolate mirando AutoCAD
+  directamente.
+
+  **VALIDADO EN VIVO** (2026-06-25/26) con el proyecto `23099 - AIR LIQUIDE HUELVA`
+  (DWG `23099-PIP-MOD-0001_R9.dwg`):
+  - Modo `pnpids`: válvulas 200171 / 200275 / 200293 localizadas y encuadradas en vista 3D
+    (commit `b1897a5`, 2026-06-25).
+  - Modo `line`: línea `10"-609001OG010-A01SC1SX` → 206 PnPIDs resueltos → `found=0` en R9
+    (línea en otro DWG; filtrado correcto) (commit `660a8bc`, 2026-06-26).
+  - Modo `tag`: resuelve vía `PnPTagRegistry` + fallback `Equipment` (commit `660a8bc`).
+  - Modo `isolate`: PnPID 200293 → solo la válvula visible; confirmado visualmente (commit
+    `e723da7`, 2026-06-26).
+  Tests unitarios: suite 1141 verdes.
+
+- `unisolate` — **EXCEPCION: va por el plugin .NET, NO por SQLite.** Revierte el aislamiento
+  aplicado por `locate` con `isolate:true`, restaurando la visibilidad completa del modelo
+  (ejecuta `UNISOLATEOBJECTS`). No requiere parámetros adicionales. Mismas exigencias de
+  backend `file_ipc` que `locate`. **VALIDADO EN VIVO** (2026-06-26, `23099 - AIR LIQUIDE
+  HUELVA`): restauró el modelo completo confirmado visualmente. Commit: `e723da7`.
+
+  **PRECAUCION — `view.get_screenshot` tras unisolate:** misma limitación que con `isolate`
+  (capturas en negro); confirmar en pantalla.
 
 - `plugin_status` — **EXCEPCION: va por el plugin .NET, NO por SQLite.** Ping al plugin para
   verificar que está cargado y responde. Payload: `{plugin, version, plant3d_available,
@@ -229,8 +270,12 @@ Para recompilar el plugin hay que CERRAR AutoCAD antes (NETLOAD bloquea `bin/Rel
 - Build C# Release: compila limpia (0 avisos/errores) en el entorno actual (net8.0-windows, VS Code + .NET SDK 9).
 - DLLs en `C:\Program Files\Autodesk\AutoCAD 2026\PLNT3D\` y `...\AutoCAD 2026\`.
 - Tests unitarios: 28 (`tests/test_file_ipc_plant.py`, mockean PostMessage/trigger), suite total 1092 verdes.
-- **`locate` VALIDADA EN VIVO** (2026-06-25, `23099 - AIR LIQUIDE HUELVA`): PnPIDs 200171/200275/200293 OK.
-- **`plugin_status` VALIDADA EN VIVO** (2026-06-25, mismo proyecto).
+- **`locate` VALIDADA EN VIVO** (2026-06-25/26, `23099 - AIR LIQUIDE HUELVA`): PnPIDs
+  200171/200275/200293 OK (pnpids); modo tag (PnPTagRegistry + fallback Equipment); modo line
+  (206 PnPIDs resueltos, found=0 correcto); isolate (PnPID 200293, confirmado visualmente);
+  unisolate (restauración completa, confirmada). Commits: `b1897a5`, `660a8bc`, `e723da7`.
+- **`unisolate` VALIDADA EN VIVO** (2026-06-26, mismo proyecto). Commit: `e723da7`.
+- **`plugin_status` VALIDADA EN VIVO** (2026-06-25, mismo proyecto). Commit: `b1897a5`.
 - La ESCRITURA en Plant 3D (p.ej. `assign-layers-by-property`) sigue PENDIENTE / no abordada aún.
 
 > El historial de implementación operación por operación (fechas, conteos de tests, commits,
