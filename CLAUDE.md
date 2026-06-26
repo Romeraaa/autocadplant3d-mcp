@@ -26,7 +26,7 @@ En este proyecto operas SIEMPRE como **orquestador**, sin necesidad de invocar `
 | `dotnet-plugin-dev` | Plugin C# de Plant 3D | opus |
 | `test-runner` | Tests `pytest` | sonnet |
 | `docs-writer` | Documentación y memoria (en español) | sonnet |
-| `code-reviewer` | Revisión read-only del diff | opus |
+| `code-reviewer` | Revisión read-only del diff | sonnet |
 
 ### Protocolo
 1. Descompón la petición y reúne contexto (leyendo tú mismo).
@@ -40,6 +40,10 @@ El coste está dominado por el número de subagentes y por cuánto contexto reca
 - **Cambio trivial** (1 fichero, mecánico: un comentario, un literal, un test aislado, renombrar): **un solo agente**, sin cadena. Sáltate `code-reviewer` si no toca lógica.
 - **Cambio normal** (una operación, un fix con su test): el agente que escribe (`mcp-python-dev`, etc.) puede **escribir código y sus tests en la misma pasada**; luego `code-reviewer`. No metas `test-runner` aparte salvo que quieras verificación independiente o haya muchos tests.
 - **Feature multi-parte / con esquema SQLite nuevo**: cadena completa `sqlite-analyst` → `mcp-python-dev` → `test-runner` → `code-reviewer`.
+
+**Disciplina de contexto (lo que más ahorra).** El coste está dominado por la *caché de contexto re-leída en cada turno*, no por lo que se escribe (medido: ~86% del gasto es cache read/write). Por tanto:
+- **Corta la sesión en cada hito.** Al cerrar un hito (commit + memoria actualizada), usa `/clear` o `/compact`. El coste de una sesión crece con (tamaño de contexto × nº de turnos); las sesiones largas que arrastran contexto enorme son el mayor sumidero.
+- **No cargues ficheros grandes en la sesión principal.** Leer `server.py` entero en la principal lo mete en caché y se re-lee en CADA turno posterior. Léelo por rango `file:línea` o delega la lectura en un subagente (muere y se lleva ese contexto).
 
 ### Briefings baratos (inyéctalo a cada subagente)
 - **No re-leas ficheros ya citados** en el briefing; si das tú el fragmento relevante, que no vuelva a abrir el fichero entero.
