@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import quote
 
@@ -82,16 +83,130 @@ def find_project_root(path_inside: str) -> Path:
     )
 
 
+def _strip_ns(tag: str) -> str:
+    """Return an XML tag without its ``{namespace}`` prefix, if any."""
+    return tag.rsplit("}", 1)[-1]
+
+
+def _parse_project_xml(xml_path: Path) -> dict:
+    """Parse a Plant 3D ``Project.xml`` tolerantly.
+
+    Returns a dict with ``name``, ``description``, ``version``, ``parts`` (a
+    list of ProjectPart names), ``part_files`` (a list of their
+    ``relativeFileName`` values), ``units`` (Metric/Imperial/None inferred from
+    those filenames) and ``spec_sheets_dir`` (the SpecSheets
+    ``relativeDirectoryName`` if present). Any missing node yields None/[]; a
+    malformed or unreadable file yields an all-empty result rather than raising.
+    The reader is BOM/encoding tolerant (ElementTree decodes the XML declaration
+    or the UTF-8 BOM on its own when handed raw bytes).
+    """
+    info: dict = {
+        "name": None,
+        "description": None,
+        "version": None,
+        "parts": [],
+        "part_files": [],
+        "units": None,
+        "spec_sheets_dir": None,
+    }
+    try:
+        root = ET.fromstring(xml_path.read_bytes())
+    except (OSError, ET.ParseError):
+        return info
+
+    # Index direct children by local (namespace-stripped) tag.
+    by_tag: dict[str, list[ET.Element]] = {}
+    for child in root:
+        by_tag.setdefault(_strip_ns(child.tag), []).append(child)
+
+    def _first_text(tag: str) -> str | None:
+        nodes = by_tag.get(tag)
+        if nodes and nodes[0].text and nodes[0].text.strip():
+            return nodes[0].text.strip()
+        return None
+
+    info["name"] = _first_text("ProjectName")
+    info["description"] = _first_text("ProjectDescription")
+
+    # ProjectVersion may carry the number as text or as a .Minor/Major attr.
+    ver_nodes = by_tag.get("ProjectVersion")
+    if ver_nodes:
+        ver = ver_nodes[0]
+        if ver.text and ver.text.strip():
+            info["version"] = ver.text.strip()
+        else:
+            minor = ver.get("Minor") or ver.get("minor")
+            major = ver.get("Major") or ver.get("major")
+            if major is not None and minor is not None:
+                info["version"] = f"{major}.{minor}"
+            elif minor is not None:
+                info["version"] = str(minor)
+
+    # ProjectParts → ProjectPart name=.. relativeFileName=..
+    for parts_node in by_tag.get("ProjectParts", []):
+        for part in parts_node:
+            if _strip_ns(part.tag) != "ProjectPart":
+                continue
+            name = part.get("name")
+            if name:
+                info["parts"].append(name)
+            rel = part.get("relativeFileName")
+            if rel:
+                info["part_files"].append(rel)
+
+    # ProjectPartDirectories → ProjectPartDirectory name="SpecSheets" ...
+    for dirs_node in by_tag.get("ProjectPartDirectories", []):
+        for d in dirs_node:
+            if _strip_ns(d.tag) != "ProjectPartDirectory":
+                continue
+            if d.get("name") == "SpecSheets":
+                info["spec_sheets_dir"] = d.get("relativeDirectoryName")
+
+    # Units are encoded in the part filenames (Metric_*.xml / Imperial_*.xml).
+    joined = " ".join(info["part_files"]).lower()
+    if "metric_" in joined:
+        info["units"] = "Metric"
+    elif "imperial_" in joined:
+        info["units"] = "Imperial"
+
+    return info
+
+
 def project_info(project: str) -> dict:
-    """Return basic identification of a resolved project."""
+    """Return identification and orientation metadata of a resolved project.
+
+    Keeps the legacy fields (``ok``, ``name``, ``path``, ``has_piping``,
+    ``has_pid``) for backward compatibility (used by detect_project) and adds
+    the metadata parsed from ``Project.xml`` (``description``, ``version``,
+    ``parts``, ``units``, ``spec_sheets_dir``) plus ``drawing_counts`` (the
+    ``by_type`` breakdown produced by :func:`list_drawings`).
+    """
     d = resolve_project_dir(project)
-    return {
+    result = {
         "ok": True,
         "name": d.name,
         "path": str(d),
         "has_piping": (d / "Piping.dcf").is_file(),
         "has_pid": (d / "ProcessPower.dcf").is_file(),
     }
+
+    meta = _parse_project_xml(d / "Project.xml")
+    # Prefer the project name declared in Project.xml; fall back to folder name.
+    if meta["name"]:
+        result["name"] = meta["name"]
+    result["description"] = meta["description"]
+    result["version"] = meta["version"]
+    result["parts"] = meta["parts"]
+    result["units"] = meta["units"]
+    result["spec_sheets_dir"] = meta["spec_sheets_dir"]
+
+    # Drawing breakdown; degrade gracefully if it cannot be computed.
+    try:
+        result["drawing_counts"] = list_drawings(str(d)).get("by_type", {})
+    except Exception:
+        result["drawing_counts"] = {}
+
+    return result
 
 
 def _db_path(project_dir: Path, db_name: str) -> Path:
@@ -155,6 +270,153 @@ def list_projects(root: str | None = None) -> dict:
                 }
             )
     return {"ok": True, "root": str(base), "count": len(projects), "projects": projects}
+
+
+def _as_text(value) -> str | None:
+    """Decode a possibly non-ASCII SQLite value to str (errors replaced).
+
+    PnPDrawings rows may surface windows-1252 bytes (or BLOB affinity) for
+    drawing names; this guarantees a usable ``str`` regardless of how the value
+    came back from SQLite, so classification and the output never crash.
+    """
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", "replace")
+    return str(value)
+
+
+def _classify_drawing(pnp_type: str | None, name: str | None, rel_path: str | None,
+                      *, from_pid_db: bool) -> str:
+    """Classify a PnPDrawings row into an orientation drawing type.
+
+    ``from_pid_db`` is True for rows read from ProcessPower.dcf (P&ID), where a
+    plain ``DWG`` is a P&ID drawing rather than a 3D model.
+    """
+    t = (_as_text(pnp_type) or "").strip().upper()
+    n = (_as_text(name) or "").strip().lower()
+    rp = (_as_text(rel_path) or "").strip().lower().replace("/", "\\")
+
+    if t == "SPEC" or n.endswith(".pspx"):
+        return "spec_sheet"
+    if t == "FOLDER":
+        return "folder"
+    if rp.startswith("isometric\\"):
+        return "isometric"
+    if rp.startswith("orthos\\") or rp.startswith("ortho\\"):
+        return "ortho"
+    if from_pid_db:
+        return "pid"
+    return "3d_model"
+
+
+def _read_drawings_table(db: Path, *, from_pid_db: bool) -> tuple[list[dict], str | None]:
+    """Read and classify the PnPDrawings table of one ``.dcf`` database.
+
+    Returns ``(rows, note)`` where ``rows`` is a list of classified drawing
+    dicts and ``note`` is a degradation message (or None). Tolerant of a
+    missing table or missing/extra columns and of non-ASCII drawing names
+    (the connection decodes text with ``errors='replace'``).
+    """
+    con = _connect_ro(db)
+    # Some PnPDrawings rows carry windows-1252 / non-UTF-8 bytes; decode
+    # leniently so a stray byte never aborts the whole listing.
+    con.text_factory = lambda b: b.decode("utf-8", "replace") if isinstance(b, bytes) else b
+    try:
+        if not _table_exists(con, "PnPDrawings"):
+            return [], f"{db.name}: tabla PnPDrawings ausente."
+        cols = _table_columns(con, "PnPDrawings")
+        # PnPID y "Dwg Name" son imprescindibles para que haya listado; el resto
+        # son opcionales y pueden faltar en otros proyectos sin que se pierda
+        # todo el listado (se rellenan con None).
+        if "PnPID" not in cols or "Dwg Name" not in cols:
+            return [], f"{db.name}: columnas de PnPDrawings inesperadas."
+        # Selecciona NULL para las columnas opcionales ausentes, manteniendo
+        # alias estables para el resto del código.
+        ptype_sel = "PnPType" if "PnPType" in cols else "NULL"
+        rel_sel = "PnPRelativePath" if "PnPRelativePath" in cols else "NULL"
+        title_sel = "Title" if "Title" in cols else "NULL"
+        author_sel = "Author" if "Author" in cols else "NULL"
+        try:
+            raw = con.execute(
+                f'SELECT PnPID AS id, "Dwg Name" AS name, {ptype_sel} AS ptype, '
+                f"{rel_sel} AS rel, {title_sel} AS title, {author_sel} AS author "
+                "FROM PnPDrawings"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # Column layout differs on this project: degrade rather than raise.
+            return [], f"{db.name}: columnas de PnPDrawings inesperadas."
+    finally:
+        con.close()
+
+    out: list[dict] = []
+    for r in raw:
+        dtype = _classify_drawing(r["ptype"], r["name"], r["rel"], from_pid_db=from_pid_db)
+        out.append(
+            {
+                "drawing_id": r["id"],
+                "name": _as_text(r["name"]),
+                "type": dtype,
+                "rel_path": _as_text(r["rel"]),
+                "title": _as_text(r["title"]),
+                "author": _as_text(r["author"]),
+            }
+        )
+    return out, None
+
+
+def list_drawings(project: str) -> dict:
+    """List and classify every drawing registered in a Plant 3D project.
+
+    Reads the ``PnPDrawings`` table from Piping.dcf (3D models, spec sheets,
+    navigation folders, isometrics, orthos) and, when present, ProcessPower.dcf
+    (P&IDs). Each row is classified into one of ``3d_model``, ``spec_sheet``,
+    ``folder``, ``isometric``, ``ortho`` or ``pid``.
+
+    Tolerant by design: a missing ProcessPower.dcf lists only Piping; a missing
+    PnPDrawings table degrades with a note instead of raising. Results are
+    sorted by ``type`` then ``name``.
+
+    Returns ``{ok, project, path, count, by_type, drawings[, notes]}``.
+    """
+    d = resolve_project_dir(project)
+
+    drawings: list[dict] = []
+    notes: list[str] = []
+
+    piping = d / "Piping.dcf"
+    if piping.is_file() and _is_sqlite(piping):
+        rows, note = _read_drawings_table(piping, from_pid_db=False)
+        drawings.extend(rows)
+        if note:
+            notes.append(note)
+    else:
+        notes.append("Piping.dcf ausente o no es SQLite.")
+
+    pid = d / "ProcessPower.dcf"
+    if pid.is_file() and _is_sqlite(pid):
+        rows, note = _read_drawings_table(pid, from_pid_db=True)
+        drawings.extend(rows)
+        if note:
+            notes.append(note)
+
+    drawings.sort(key=lambda x: (x["type"], (x["name"] or "").lower()))
+
+    by_type: dict[str, int] = {}
+    for dw in drawings:
+        by_type[dw["type"]] = by_type.get(dw["type"], 0) + 1
+
+    result = {
+        "ok": True,
+        "project": d.name,
+        "path": str(d),
+        "count": len(drawings),
+        "by_type": by_type,
+        "drawings": drawings,
+    }
+    if notes:
+        result["notes"] = notes
+    return result
 
 
 def _fmt_size(value: float | int, unit: str | None) -> str:

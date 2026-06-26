@@ -617,6 +617,11 @@ async def plant3d(
                        shop_field?, item_type?, limit?}
       list_projects  — Lista proyectos bajo una raíz. data: {root?}
                        (usa AUTOCAD_MCP_PLANT3D_ROOT si no se indica root)
+      list_drawings  — Lista y clasifica los dibujos del proyecto (PnPDrawings
+                       de Piping.dcf y, si existe, ProcessPower.dcf). Tipos:
+                       3d_model | spec_sheet | folder | isometric | ortho | pid.
+                       Solo lectura. data: {project?}
+                       Devuelve {ok, project, path, count, by_type, drawings}.
       locate         — Localiza objetos Plant 3D en el DIBUJO por PnPID y los
                        resalta/encuadra. A diferencia de las consultas SQLite
                        (que solo leen los .dcf), esta operación SÍ localiza el
@@ -656,6 +661,9 @@ async def plant3d(
     elif operation == "list_lines":
         project = data.get("project") or await _detect_open_project()
         result = plant3d_query.list_lines(project, data)
+    elif operation == "list_drawings":
+        project = data.get("project") or await _detect_open_project()
+        result = plant3d_query.list_drawings(project)
     elif operation == "list_components":
         project = data.get("project") or await _detect_open_project()
         # "DWG abierto en AutoCAD": active_dwg:true o dwg:"@active" leen DWGNAME
