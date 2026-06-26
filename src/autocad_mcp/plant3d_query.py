@@ -576,6 +576,126 @@ def resolve_handles(project: str, pnpids: list[int]) -> list[dict]:
     return out
 
 
+def pnpids_for_tag(project: str, tag: str) -> list[int]:
+    """Resolve a Plant 3D tag to its PnPID(s) via Piping.dcf (SQLite).
+
+    Looks up ``PnPTagRegistry`` — the project-wide tag registry whose ``RowId``
+    is the tagged object's PnPID and whose ``Tag`` holds the displayed tag. It
+    already covers lines, equipment, valves, instruments and any tagged
+    component, so it is the single best lookup for "find object by tag".
+
+    Matching follows the rest of the module's convention: TRIM + UPPER on both
+    sides, so leading/trailing spaces and case are ignored. Returns a
+    duplicate-free list of PnPIDs (int).
+
+    Tolerant by design: if ``PnPTagRegistry`` is absent, it falls back to
+    ``Equipment.Tag``; if neither exists, an empty list is returned instead of
+    raising.
+    """
+    tag = (tag or "").strip()
+    if not tag:
+        return []
+
+    project_dir = resolve_project_dir(project)
+    db = _db_path(project_dir, "Piping.dcf")
+
+    con = _connect_ro(db)
+    try:
+        cur = con.cursor()
+        # Vía principal: PnPTagRegistry (RowId = PnPID del objeto etiquetado).
+        try:
+            rows = cur.execute(
+                """
+                SELECT RowId AS pnpid
+                FROM PnPTagRegistry
+                WHERE UPPER(TRIM(Tag)) = UPPER(TRIM(?))
+                """,
+                [tag],
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = None
+
+        # Fallback opcional: Equipment.Tag (solo si no existe PnPTagRegistry).
+        if rows is None:
+            try:
+                rows = cur.execute(
+                    """
+                    SELECT PnPID AS pnpid
+                    FROM Equipment
+                    WHERE UPPER(TRIM(Tag)) = UPPER(TRIM(?))
+                    """,
+                    [tag],
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return []
+    finally:
+        con.close()
+
+    seen: set[int] = set()
+    out: list[int] = []
+    for r in rows:
+        val = r["pnpid"]
+        if val is None:
+            continue
+        pid = int(val)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        out.append(pid)
+    return out
+
+
+def pnpids_for_line(project: str, line_tag: str) -> list[int]:
+    """Resolve a line number to the PnPIDs of its components via Piping.dcf.
+
+    Returns the PnPIDs of every physical component whose
+    ``PipeRunComponent.LineNumberTag`` matches ``line_tag`` (TRIM + UPPER on
+    both sides, like the rest of the module). The same line may span several
+    drawings; this returns all of its components — the .NET plugin later filters
+    to the active drawing.
+
+    Returns a duplicate-free list of PnPIDs (int). Tolerant by design: if the
+    ``PipeRunComponent`` table or its columns are absent, an empty list is
+    returned instead of raising.
+    """
+    line_tag = (line_tag or "").strip()
+    if not line_tag:
+        return []
+
+    project_dir = resolve_project_dir(project)
+    db = _db_path(project_dir, "Piping.dcf")
+
+    con = _connect_ro(db)
+    try:
+        cur = con.cursor()
+        try:
+            rows = cur.execute(
+                """
+                SELECT PnPID AS pnpid
+                FROM PipeRunComponent
+                WHERE UPPER(TRIM(LineNumberTag)) = UPPER(TRIM(?))
+                """,
+                [line_tag],
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+    finally:
+        con.close()
+
+    seen: set[int] = set()
+    out: list[int] = []
+    for r in rows:
+        val = r["pnpid"]
+        if val is None:
+            continue
+        pid = int(val)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        out.append(pid)
+    return out
+
+
 def pnpids_in_dwg(project: str, dwg_name: str) -> set[int]:
     """Return the set of PnPIDs physically present in a given drawing.
 

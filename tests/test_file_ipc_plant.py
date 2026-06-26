@@ -290,19 +290,24 @@ class _FakeBackend:
         )
 
 
-def _patch_backend(name, targets=None):
+def _patch_backend(name, targets=None, tag_map=None, line_map=None):
     """Context manager-ish helper patching server internals for locate tests.
 
     Patches:
     - server.get_backend → a fake backend of the given ``name``.
     - server._detect_open_project → returns a dummy project string.
     - plant3d_query.resolve_handles → returns ``targets`` (default []).
+    - plant3d_query.pnpids_for_tag → looks up ``tag_map`` (default {}).
+    - plant3d_query.pnpids_for_line → looks up ``line_map`` (default {}).
 
     Returns a contextlib.ExitStack already entered; use with ``with``.
     """
     import contextlib
 
     from autocad_mcp import plant3d_query, server
+
+    tag_map = tag_map or {}
+    line_map = line_map or {}
 
     async def fake_get_backend():
         return _FakeBackend(name)
@@ -317,6 +322,12 @@ def _patch_backend(name, targets=None):
     )
     stack.enter_context(
         patch.object(plant3d_query, "resolve_handles", lambda project, pnpids: targets or [])
+    )
+    stack.enter_context(
+        patch.object(plant3d_query, "pnpids_for_tag", lambda project, tag: list(tag_map.get(tag, [])))
+    )
+    stack.enter_context(
+        patch.object(plant3d_query, "pnpids_for_line", lambda project, line: list(line_map.get(line, [])))
     )
     return stack
 
@@ -416,6 +427,87 @@ class TestServerLocateRouting:
         assert parsed["ok"] is True
         assert parsed["payload"]["plugin"] == "PlantMcpDispatch"
         assert parsed["operation"] == "plugin_status"
+
+
+class TestServerLocateByTagLine:
+    """plant3d.locate resuelve PnPIDs a partir de 'tag' o 'line' vía SQLite."""
+
+    @pytest.mark.asyncio
+    async def test_locate_by_tag_resolves_and_forwards(self):
+        from autocad_mcp import server
+
+        with _patch_backend("file_ipc", tag_map={"V-01": [11, 12]}):
+            out = await server.plant3d(
+                operation="locate", data={"tag": "V-01"}
+            )
+
+        parsed = json.loads(out)
+        assert parsed["ok"] is True
+        assert parsed["payload"]["requested"] == [11, 12]
+        assert parsed["resuelto_por"] == {
+            "by": "tag",
+            "value": "V-01",
+            "pnpids_resueltos": 2,
+        }
+
+    @pytest.mark.asyncio
+    async def test_locate_by_line_resolves_and_forwards(self):
+        from autocad_mcp import server
+
+        with _patch_backend("file_ipc", line_map={"1001-PG-001": [10, 11]}):
+            out = await server.plant3d(
+                operation="locate", data={"line": "1001-PG-001"}
+            )
+
+        parsed = json.loads(out)
+        assert parsed["ok"] is True
+        assert parsed["payload"]["requested"] == [10, 11]
+        assert parsed["resuelto_por"]["by"] == "line"
+        assert parsed["resuelto_por"]["pnpids_resueltos"] == 2
+
+    @pytest.mark.asyncio
+    async def test_locate_by_tag_not_found_spanish_error(self):
+        from autocad_mcp import server
+
+        with _patch_backend("file_ipc", tag_map={}):
+            out = await server.plant3d(
+                operation="locate", data={"tag": "NO-EXISTE"}
+            )
+
+        parsed = json.loads(out)
+        assert parsed["ok"] is False
+        assert "NO-EXISTE" in parsed["error"]
+        assert "tag" in parsed["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_locate_by_line_not_found_spanish_error(self):
+        from autocad_mcp import server
+
+        with _patch_backend("file_ipc", line_map={}):
+            out = await server.plant3d(
+                operation="locate", data={"line": "L-9"}
+            )
+
+        parsed = json.loads(out)
+        assert parsed["ok"] is False
+        assert "L-9" in parsed["error"]
+        assert "línea" in parsed["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_explicit_pnpids_take_precedence_over_tag(self):
+        from autocad_mcp import server
+
+        # Si vienen pnpids explícitos, no se mira el tag.
+        with _patch_backend("file_ipc", tag_map={"V-01": [99]}):
+            out = await server.plant3d(
+                operation="locate",
+                data={"pnpids": [7], "tag": "V-01"},
+            )
+
+        parsed = json.loads(out)
+        assert parsed["ok"] is True
+        assert parsed["payload"]["requested"] == [7]
+        assert "resuelto_por" not in parsed
 
 
 class TestServerPnidProbeRouting:

@@ -629,8 +629,13 @@ async def plant3d(
                        SQLite: requiere AutoCAD 2026 abierto con el plugin
                        PlantMcpDispatch cargado (NETLOAD) y el DWG de modelo
                        correspondiente abierto.
-                       data: {pnpids: [int] (o pnpid único), zoom?=True,
-                       select?=True}
+                       Los objetos se indican por PnPID, o se resuelven a PnPIDs
+                       vía SQLite a partir de un 'tag' (PnPTagRegistry) o de una
+                       'line' (número de línea; PipeRunComponent). Como el plugin
+                       filtra por el DWG activo, de una línea/tag multi-dibujo
+                       solo se localizan los objetos del dibujo abierto.
+                       data: {pnpids: [int] (o pnpid único) | tag | line,
+                       zoom?=True, select?=True, project?}
       plugin_status  — Comprueba que el plugin .NET responde (ping). Devuelve
                        {plugin, version, plant3d_available, project}. Requiere
                        AutoCAD abierto con el plugin cargado (NETLOAD).
@@ -783,8 +788,15 @@ async def _require_plant_plugin_backend():
 
 
 async def _plant3d_locate(data: dict) -> ToolResult:
-    """Locate Plant 3D objects in the drawing by PnPID via the .NET plugin."""
+    """Locate Plant 3D objects in the drawing via the .NET plugin.
+
+    Targets can be given directly as ``pnpids``/``pnpid`` or resolved from a
+    ``tag`` (via ``PnPTagRegistry``) or a ``line`` number (via
+    ``PipeRunComponent.LineNumberTag``), both looked up read-only in Piping.dcf.
+    """
     backend = await _require_plant_plugin_backend()
+
+    from autocad_mcp import plant3d_query
 
     # Normalize pnpids: accept a single 'pnpid' or a 'pnpids' list.
     pnpids = data.get("pnpids")
@@ -792,10 +804,45 @@ async def _plant3d_locate(data: dict) -> ToolResult:
         pnpids = [data["pnpid"]]
     if isinstance(pnpids, int):
         pnpids = [pnpids]
+
+    # Si no hay pnpids explícitos, resuélvelos por tag o por línea (SQLite).
+    # 'resolved_from' es informativo para la salida.
+    resolved_from: dict | None = None
+    project = data.get("project")
+    if not pnpids and data.get("tag"):
+        tag = str(data["tag"])
+        project = project or await _detect_open_project()
+        pnpids = plant3d_query.pnpids_for_tag(project, tag)
+        if not pnpids:
+            return _json({
+                "ok": False,
+                "error": (
+                    f"No se encontró ningún objeto con el tag '{tag}' en el "
+                    "proyecto."
+                ),
+            })
+        resolved_from = {"by": "tag", "value": tag, "pnpids_resueltos": len(pnpids)}
+    elif not pnpids and data.get("line"):
+        line = str(data["line"])
+        project = project or await _detect_open_project()
+        pnpids = plant3d_query.pnpids_for_line(project, line)
+        if not pnpids:
+            return _json({
+                "ok": False,
+                "error": (
+                    f"No se encontró ninguna línea '{line}' (sin componentes) "
+                    "en el proyecto."
+                ),
+            })
+        resolved_from = {"by": "line", "value": line, "pnpids_resueltos": len(pnpids)}
+
     if not pnpids:
         return _json({
             "ok": False,
-            "error": "plant3d.locate requiere 'pnpids' (lista de enteros) no vacía.",
+            "error": (
+                "plant3d.locate requiere 'pnpids' (lista de enteros) no vacía, "
+                "o bien 'tag' o 'line' para resolverlos."
+            ),
         })
 
     # Coerce/validate every element to int (the C# plugin uses int.TryParse,
@@ -823,14 +870,14 @@ async def _plant3d_locate(data: dict) -> ToolResult:
     # Resolve each PnPID to its drawing handle(s) from the SQLite project DB,
     # so the plugin can grab objects by handle instead of relying on the
     # Plant 3D API. A pnpid with no row in PnPDataLinks simply yields no target.
-    from autocad_mcp import plant3d_query
-
-    project = data.get("project") or await _detect_open_project()
+    project = project or await _detect_open_project()
     targets = plant3d_query.resolve_handles(project, pnpids)
 
     result = await backend.plant_locate(pnpids, targets, zoom, select)
     out = result.to_dict()
     out["operation"] = "locate"
+    if resolved_from is not None:
+        out["resuelto_por"] = resolved_from
     return _json(out)
 
 
