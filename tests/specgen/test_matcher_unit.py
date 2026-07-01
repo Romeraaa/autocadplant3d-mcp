@@ -7,8 +7,8 @@ import uuid
 
 import pytest
 
-from specgen.matcher import CatalogMatcher
-from specgen.piping_class import PipingClassEntry
+from autocad_mcp.specgen.matcher import CatalogMatcher
+from autocad_mcp.specgen.piping_class import PipingClassEntry
 
 
 class _FakeIndex:

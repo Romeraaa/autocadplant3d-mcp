@@ -6,8 +6,8 @@ import os
 import sqlite3
 import uuid
 
-from specgen.catalog_extender import deduce_h2_targets
-from specgen.piping_class import PipingClassEntry
+from autocad_mcp.specgen.catalog_extender import deduce_h2_targets
+from autocad_mcp.specgen.piping_class import PipingClassEntry
 
 
 def _entry(lcode, base, is_h2) -> PipingClassEntry:

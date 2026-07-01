@@ -33,6 +33,7 @@ __all__ = [
     "spec_builder",
     "catalog_extender",
     "report",
+    "api",
 ]
 
 __version__ = "0.1.0"

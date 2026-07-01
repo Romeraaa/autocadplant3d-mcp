@@ -1015,6 +1015,105 @@ async def _plant3d_pnid_probe(data: dict) -> ToolResult:
 
 
 # ==========================================================================
+# 10. specgen — Plant 3D spec authoring from a piping-class Excel
+# ==========================================================================
+
+
+@mcp.tool(annotations={"title": "Plant 3D Spec Authoring", "readOnlyHint": False})
+@_safe("specgen")
+async def specgen(
+    operation: str,
+    data: dict | None = None,
+) -> ToolResult:
+    """Genera una spec de AutoCAD Plant 3D (.pspc/.pspx) a partir de un piping class Excel.
+
+    Empareja cada fila del piping class contra un directorio de catálogos (.pcat, SQLite,
+    abiertos en solo lectura) con un modelo de confianza (ALTA/MEDIA/SUSTITUCION/BAJA) y
+    materializa las piezas elegidas. Opcionalmente amplía los catálogos con las variantes
+    de servicio de hidrógeno (-H2) deducidas del propio Excel. Nunca modifica los catálogos
+    de entrada: la ampliación siempre trabaja sobre COPIAS dentro de 'out'.
+
+    Operations:
+      analyze — SOLO ANÁLISIS (no construye spec). Parsea el Excel, empareja contra los
+                catálogos y devuelve la cobertura por nivel de confianza, los recuentos por
+                familia (hoja) y la LISTA DE HUECOS (piezas sin match). Es lo que usa un
+                ingeniero para "ver qué tal casa este piping class". Si se indica 'out',
+                escribe además REVISION_MATCHING.xlsx y devuelve su ruta (único fichero que
+                escribe). Con extend_h2=True empareja contra los catálogos -H2 ampliados
+                (exige 'out'; escribe las copias en out/catalogs).
+                data: {piping_class, catalogs, out?, extend_h2?}
+                Devuelve {ok, coverage, by_family, gaps, review_xlsx, extend_h2?}.
+      build   — PIPELINE COMPLETO: parsea, (amplía -H2), empareja, escribe
+                REVISION_MATCHING.xlsx, construye <spec_name>.pspc + .pspx y ejecuta la
+                verificación interna (integrity_check + consistencia de grafo + .pspx ZIP/XML
+                válido). Devuelve las rutas de los ficheros generados, la cobertura y el
+                resumen de verificación. 'ok' solo es True si la spec supera todas las
+                comprobaciones de integridad.
+                data: {piping_class, catalogs, out, spec_name?, extend_h2?, template_pspc?}
+                (spec_name por defecto = nombre del piping class; template_pspc aporta la
+                branch table vía su .pspx hermano.)
+                Devuelve {ok, spec_name, files, components_built, coverage, verify,
+                extend_h2?}.
+      extend_catalog — Crea únicamente las variantes -H2 en copias de los catálogos bajo
+                out/catalogs (no construye spec ni empareja para BOM). Devuelve las rutas,
+                el nº de familias/filas creadas y los L-codes base cubiertos.
+                data: {piping_class, catalogs, out}
+                Devuelve {ok, out_dir, catalogs, families_created, rows_created,
+                lcodes_covered, per_catalog, warnings}.
+    """
+    data = data or {}
+    from autocad_mcp.specgen import api as specgen_api
+
+    piping_class = data.get("piping_class")
+    catalogs = data.get("catalogs")
+    out = data.get("out")
+
+    # --- Common parameter validation (Spanish, returned as JSON, never raised) ---
+    if not piping_class:
+        return _json({"error": "Falta el parámetro obligatorio 'piping_class'."})
+    if not catalogs:
+        return _json({"error": "Falta el parámetro obligatorio 'catalogs'."})
+    if not os.path.isfile(piping_class):
+        return _json({"error": f"No existe el piping class: {piping_class}"})
+    if not os.path.isdir(catalogs):
+        return _json({"error": f"No existe la carpeta de catálogos: {catalogs}"})
+
+    if operation == "analyze":
+        result = specgen_api.analyze(
+            piping_class=piping_class,
+            catalogs_dir=catalogs,
+            out_dir=out,
+            extend_h2=bool(data.get("extend_h2")),
+        )
+        return _json(result)
+
+    if operation == "build":
+        if not out:
+            return _json({"error": "Falta el parámetro obligatorio 'out' (carpeta de salida)."})
+        result = specgen_api.build(
+            piping_class=piping_class,
+            catalogs_dir=catalogs,
+            out_dir=out,
+            spec_name=data.get("spec_name"),
+            extend_h2=bool(data.get("extend_h2")),
+            template_pspc=data.get("template_pspc"),
+        )
+        return _json(result)
+
+    if operation == "extend_catalog":
+        if not out:
+            return _json({"error": "Falta el parámetro obligatorio 'out' (carpeta de salida)."})
+        result = specgen_api.extend_catalog(
+            piping_class=piping_class,
+            catalogs_dir=catalogs,
+            out_dir=out,
+        )
+        return _json(result)
+
+    return _json({"error": f"Unknown specgen operation: {operation}"})
+
+
+# ==========================================================================
 # Main entry point
 # ==========================================================================
 

@@ -6,7 +6,7 @@ import uuid
 
 import pytest
 
-from specgen import common
+from autocad_mcp.specgen import common
 
 
 # --------------------------------------------------------------------------- diameters / fractions

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import xml.etree.ElementTree as ET
 
-from specgen import spec_builder
-from specgen.spec_builder import (
+from autocad_mcp.specgen import spec_builder
+from autocad_mcp.specgen.spec_builder import (
     BranchCell,
     BranchSymbol,
     SpecDefinition,

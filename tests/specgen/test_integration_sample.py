@@ -9,12 +9,12 @@ from __future__ import annotations
 import os
 import zipfile
 
-from conftest import needs_sample
+from _sample import needs_sample
 
-from specgen.catalog_extender import deduce_h2_targets, extend_catalogs, verify as verify_h2
-from specgen.catalog_index import CatalogIndex, discover_catalogs
-from specgen.matcher import CatalogMatcher
-from specgen.piping_class import parse_workbook
+from autocad_mcp.specgen.catalog_extender import deduce_h2_targets, extend_catalogs, verify as verify_h2
+from autocad_mcp.specgen.catalog_index import CatalogIndex, discover_catalogs
+from autocad_mcp.specgen.matcher import CatalogMatcher
+from autocad_mcp.specgen.piping_class import parse_workbook
 
 
 def _matched_entries(xlsx: str, catalogs_dir: str):
@@ -82,7 +82,7 @@ def test_h2_extension_closes_codes(sample_xlsx, scratch_dir, tmp_path):
 
 @needs_sample
 def test_full_build_smoke(sample_xlsx, scratch_dir, sample_template_pspc, tmp_path):
-    from specgen.cli import main
+    from autocad_mcp.specgen.cli import main
     out = os.path.join(tmp_path, "out")
     argv = ["build", "--piping-class", sample_xlsx, "--catalogs", scratch_dir,
             "--out", out, "--extend-h2"]
