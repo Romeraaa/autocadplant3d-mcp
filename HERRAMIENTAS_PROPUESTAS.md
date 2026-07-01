@@ -289,4 +289,69 @@ con el modelo de datos ya conocido por las consultas.*
 
 ---
 
+## Fase 2 (propuesta 2026-06-29) — Extracción de P&ID legacy y generación de especificaciones
+
+> Origen: reunión con ingeniería (jun-2026). Dos focos: **extraer información de P&IDs** y **explotar/generar especificaciones y catálogos**. Análisis basado en ficheros reales aportados:
+> - P&IDs de ejemplo en `…/MCP-Plant3D/Proyectos/PID_PI2588002`: **planos legacy de Repsol Cartagena (líneas de hidrógeno, rev. 2007)** en formato **`.dgn` (MicroStation/Bentley) + PDF**. **NO son nativos de Plant 3D** (no hay `.dcf`); las herramientas SQLite de la Fase 1 no aplican aquí.
+> - Catálogo exportado en `…/MCP-Plant3D/Excel exportado_NXD-2`: dos representaciones de la **misma clase de tubería NXD-2** → `piping_class.xlsx` (documento de spec "oficial" de ingeniería, bilingüe ES/EN, una hoja por familia con código UNICODE, Ø, schedule, rating, L-code, límites P/T) y `prueba.xlsx` (**export del Spec Editor de Plant 3D**: hojas *Spec Sheet*, *Branch Table*, *Spec Data* con 415 componentes y todos los atributos).
+>
+> **Hallazgo clave:** el PDF de los P&ID tiene **capa de texto vectorial real** (no es imagen escaneada). Se extrae texto limpio (tags de línea, Ø, válvulas/instrumentos `FCV`/`PCV`/`PI`/`FE`, servicios, notas, cajetín) **sin OCR**, parseando el PDF. Vía recomendada frente a leer el `.dgn` (formato Bentley, complejo → fase posterior solo si hace falta geometría/conectividad).
+
+### G · Extracción de información de P&ID (parseo del texto del PDF)
+- **G1. line-list-pdf** — extraer nº de línea, Ø, servicio/fluido de cada P&ID y volcar a Excel (line list automático; hoy manual, máximo ahorro).
+- **G2. valve-instrument-index** — listar y contar válvulas e instrumentos (`FCV`, `PCV`, `PI`, `FE`…) con tag y plano.
+- **G3. equipment-list** — bombas, depósitos, cisternas, torres.
+- **G4. flag-hotspots** — marcar notas tipo `LINEA CORTADA`, `FUERA DE SERVICIO`, `NO LOCALIZADA EN PLANTA`, bridas ciegas, para revisión.
+- **G5. cross-sheet-continuity** — detectar referencias entre hojas (`P&I 38361 H.2/7`) y reconstruir continuidad de líneas.
+- **G6. drawing-register** — leer cajetín de todos los PDF (nº plano, revisión, fecha, escala, firmas) → índice de planos automático.
+- **G7. batch-folder** — procesar una carpeta entera de P&ID y consolidar los registros anteriores.
+- **G8. nl-search** — búsqueda en lenguaje natural sobre el conjunto ("¿en qué planos aparece la línea de 8\" de H2?").
+
+> Riesgo G: el texto del PDF sale sin orden espacial fiable. Para line lists precisos hay que extraer **posición** de cada texto (factible con PyMuPDF), **a validar con prueba** antes de prometer precisión.
+
+### H · Explotación de specs / catálogos (consulta sobre los Excel)
+- **H1. spec-query-nl** — consulta en lenguaje natural ("¿qué válvula uso para 3\" en NXD-2?", "¿qué schedule lleva el tubo de 6\"?").
+- **H2. branch-table-lookup** — "¿cómo conecto una derivación de 2\" sobre un colector de 6\"?" → responde según la Branch Table (p.ej. `W`=WELDOLET, `SK`=SOCKOLET, `RT1`=TE RED).
+- **H3. code-lookup** — traducir entre código UNICODE / Item Code / L-code y descripción, material, rating.
+- **H4. bom-from-linelist** — generar BOM/MTO a partir de un line list + la clase, usando la Branch Table.
+- **H5. pt-limits** — extraer y consultar la tabla de límites presión/temperatura de la spec.
+
+### I · Cruces y validación (mayor valor de ingeniería)
+- **I1. validate-plant3d-vs-oficial** — comprobar que cada componente/UNICODE del documento oficial existe en el *Spec Data* de Plant 3D y que material/schedule/rating coinciden. Caza errores de carga de spec.
+- **I2. spec-gaps** — detectar tamaños o variantes (p.ej. variante H2 `L-1276-H2`) presentes en un lado y ausentes en el otro.
+- **I3. spec-text-qa** — normalizar erratas detectadas en los datos (`VÁVULA`, `VÁLVOLET`, `VÁvula`…).
+- **I4. pid-vs-spec** — para cada línea del P&ID (Ø + servicio), comprobar que la clase cubre ese tamaño y esa variante de material.
+- **I5. spec-diff** — comparar dos exports/revisiones de spec y resaltar cambios.
+
+### J · Generación de especificaciones Plant 3D (`.pspc` / `.pspx`) — petición de ingeniería
+> Idea de ingeniería: "creamos catálogos y especificaciones a partir de un piping class (de cliente, propio…). Igual con IA, volcándole un Excel/PDF, sacamos archivos compatibles con `.pspc`/`.pspx`". Es la propuesta de mayor valor, pero la más compleja. Análisis de viabilidad:
+>
+> - **Lo fácil (donde brilla la IA): parsear y normalizar la entrada.** Convertir un piping class desordenado (Excel fiable; PDF poco fiable) en una **definición de spec estructurada**: familias, rangos de tamaño, tipos de extremo (BW/SW/THD/FLG), materiales/L-codes, descripciones ES/EN y branch table.
+> - **Lo difícil: ESCRIBIR un fichero válido que Plant 3D acepte sin corromper.**
+>   - **Dependencia dura:** una spec no inventa piezas; **selecciona piezas existentes en un catálogo `.pcat`** (cada componente apunta a una pieza por identidad/GUID). Si la pieza no existe → hay que crearla en el catálogo (más difícil).
+>   - **Vía A — API .NET oficial** (`Autodesk.ProcessPower`, automatizar Spec Editor): soportada y segura, encaja con el track del plugin .NET. Apuesta sólida a medio plazo.
+>   - **Vía B — escribir el SQLite directamente** (`.pspc`/`.pcat` son SQLite, ya sabemos leerlos): posible pero **arriesgado** (corrupción). Solo exploración.
+> - **Victoria intermedia realista:** generar la **definición de spec validada + branch table + datasheets bilingües** en el layout que importa el Spec Editor, recortando el trabajo manual de elegir pieza a pieza aunque el paso final lo dé Spec Editor.
+> - **Para evaluar viabilidad, pedir a la organización:** un `.pspc` + `.pspx` de ejemplo **junto con el catálogo `.pcat`** del que sale, y la versión de Plant 3D.
+>
+> - **J1. parse-piping-class** — Excel/PDF de piping class → definición de spec estructurada y normalizada (intermedio reutilizable).
+> - **J2. build-branch-table** — derivar/validar la matriz de conexión de derivaciones.
+> - **J3. gen-spec-sheet** — generar el layout Spec Sheet + datasheets ES/EN listos para Spec Editor.
+> - **J4. write-pspc (.NET)** — generación del `.pspc`/`.pspx` vía API .NET (fase avanzada; requiere catálogo con las piezas).
+
+### Priorización Fase 2 (preliminar)
+| Prioridad | Herramienta | Por qué |
+|---|---|---|
+| ⭐⭐⭐ | G1. line-list-pdf | Máximo ahorro; datos ya confirmados en el PDF |
+| ⭐⭐⭐ | I1. validate-plant3d-vs-oficial | Caza errores de spec; datos ya disponibles |
+| ⭐⭐⭐ | J1. parse-piping-class | Base de la generación de specs; donde más brilla la IA |
+| ⭐⭐ | G2/G6. índices y registro de planos | Entregables habituales, bajo coste |
+| ⭐⭐ | H1/H2. consulta de spec y branch table | Consulta diaria en lenguaje natural |
+| ⭐ | G3-G5, G7-G8, H3-H5, I2-I5 | Complementarias |
+| ⭐ (fase avanzada) | J2-J4. generación `.pspc`/`.pspx` | Requiere `.pcat` de ejemplo y/o API .NET |
+
+> **Pendiente de la organización para Fase 2:** confirmar si el objetivo son proyectos nuevos (Plant 3D nativo) o legacy (DGN/PDF); aportar un `.pspc`+`.pspx`+`.pcat` de ejemplo y la versión de Plant 3D; validar precisión del parseo de PDF con una prueba real.
+
+---
+
 *Documento de análisis preliminar — sesión de trabajo con Claude Code. AutoCAD MCP / Plant 3D, Fase 1: Consulta de Datos.*
