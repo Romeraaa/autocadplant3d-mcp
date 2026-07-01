@@ -58,8 +58,10 @@ async def test_bad_catalogs_dir_returns_error():
     assert "no_such_dir_xyz" in out["error"]
 
 
-async def test_build_without_out_returns_error():
-    out = await _call("build", {"piping_class": os.path.abspath(__file__), "catalogs": "."})
+async def test_build_without_out_and_no_attach_returns_error():
+    # Without 'out' and with attach_files disabled, 'out' is required again.
+    out = await _call("build", {"piping_class": os.path.abspath(__file__), "catalogs": ".",
+                                "attach_files": False})
     assert "error" in out
     assert "out" in out["error"]
 
@@ -93,6 +95,9 @@ async def test_build_generates_valid_spec(sample_xlsx, scratch_dir, sample_templ
         "catalogs": scratch_dir,
         "out": str(tmp_path / "out"),
         "extend_h2": True,
+        # keep this test focused on on-disk generation; embedding is covered in
+        # test_tool_specgen_attach.py
+        "attach_files": False,
     }
     if sample_template_pspc:
         data["template_pspc"] = sample_template_pspc

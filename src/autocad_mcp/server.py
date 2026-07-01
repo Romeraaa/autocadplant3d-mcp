@@ -6,6 +6,8 @@ Tools: drawing, entity, layer, block, annotation, pid, view, system
 from __future__ import annotations
 
 import os
+import shutil
+import tempfile
 
 import structlog
 from mcp.server.fastmcp import FastMCP
@@ -15,6 +17,7 @@ from autocad_mcp.client import (
     _json,
     _safe,
     add_screenshot_if_available,
+    attach_files_result,
     get_backend,
 )
 
@@ -1049,11 +1052,25 @@ async def specgen(
                 válido). Devuelve las rutas de los ficheros generados, la cobertura y el
                 resumen de verificación. 'ok' solo es True si la spec supera todas las
                 comprobaciones de integridad.
-                data: {piping_class, catalogs, out, spec_name?, extend_h2?, template_pspc?}
+                data: {piping_class, catalogs, out?, spec_name?, extend_h2?, template_pspc?,
+                       attach_files?}
                 (spec_name por defecto = nombre del piping class; template_pspc aporta la
                 branch table vía su .pspx hermano.)
+                ADJUNTOS EN EL CHAT: por defecto (attach_files=True) los tres ficheros
+                pequeños generados (.pspc, .pspx, REVISION_MATCHING.xlsx) se DEVUELVEN
+                INCRUSTADOS en la respuesta como recursos descargables (base64), además de
+                escribirse a disco. Pensado para cuando el servidor MCP corre en remoto y la
+                carpeta 'out' no es accesible para el ingeniero. Con attach_files=False no se
+                adjunta nada (solo se escribe a disco, comportamiento clásico).
+                'out' es OPCIONAL cuando attach_files=True: si se omite, los ficheros se
+                generan en un directorio temporal del servidor y se adjuntan al chat (la
+                respuesta lo indica en 'note'). Con attach_files=False, 'out' es obligatorio.
+                Los catálogos -H2 (extend_h2=True) NO se adjuntan (pesan decenas de MB): se
+                devuelven solo por ruta en files.catalogs_h2_dir. Ficheros que superen el
+                umbral SPECGEN_MAX_ATTACH_BYTES (def. 15 MB) o que no existan se listan en
+                'attachments_skipped' y quedan accesibles por ruta.
                 Devuelve {ok, spec_name, files, components_built, coverage, verify,
-                extend_h2?}.
+                extend_h2?, [attachments_skipped], [note]}.
       extend_catalog — Crea únicamente las variantes -H2 en copias de los catálogos bajo
                 out/catalogs (no construye spec ni empareja para BOM). Devuelve las rutas,
                 el nº de familias/filas creadas y los L-codes base cubiertos.
@@ -1088,8 +1105,22 @@ async def specgen(
         return _json(result)
 
     if operation == "build":
+        attach_files = bool(data.get("attach_files", True))
+        temp_out_note = None
+        temp_dir = None
         if not out:
-            return _json({"error": "Falta el parámetro obligatorio 'out' (carpeta de salida)."})
+            if not attach_files:
+                return _json({
+                    "error": "Falta el parámetro obligatorio 'out' (carpeta de salida). "
+                             "Indica 'out' o usa attach_files=True para recibir los ficheros "
+                             "incrustados en el chat.",
+                })
+            temp_dir = tempfile.mkdtemp(prefix="specgen_")
+            out = temp_dir
+            temp_out_note = (
+                f"'out' no indicado: los ficheros se generaron en un directorio temporal "
+                f"del servidor ({out}) y se adjuntan al chat."
+            )
         result = specgen_api.build(
             piping_class=piping_class,
             catalogs_dir=catalogs,
@@ -1098,7 +1129,27 @@ async def specgen(
             extend_h2=bool(data.get("extend_h2")),
             template_pspc=data.get("template_pspc"),
         )
-        return _json(result)
+        # Only embed on a successful build and when explicitly enabled.
+        if not attach_files or not result.get("ok"):
+            # A temp dir with no attachment to keep would be orphaned; clean it.
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            return _json(result)
+
+        if temp_out_note:
+            result["note"] = temp_out_note
+        max_bytes = int(os.environ.get("SPECGEN_MAX_ATTACH_BYTES", 15 * 1024 * 1024))
+        files = result.get("files") or {}
+        xlsx_mime = (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        # Never attach catalogs_h2_dir (a directory, tens of MB); path only.
+        to_attach = [
+            (files.get("pspc"), "application/octet-stream"),
+            (files.get("pspx"), "application/octet-stream"),
+            (files.get("review_xlsx"), xlsx_mime),
+        ]
+        return attach_files_result(result, to_attach, max_bytes)
 
     if operation == "extend_catalog":
         if not out:

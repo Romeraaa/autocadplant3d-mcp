@@ -6,10 +6,17 @@ import asyncio
 import base64
 import functools
 import json
+import os
+import pathlib
 from typing import Any
 
 import structlog
-from mcp.types import ImageContent, TextContent
+from mcp.types import (
+    BlobResourceContents,
+    EmbeddedResource,
+    ImageContent,
+    TextContent,
+)
 
 from autocad_mcp.backends.base import AutoCADBackend, CommandResult
 from autocad_mcp.config import ONLY_TEXT_FEEDBACK, detect_backend
@@ -161,3 +168,76 @@ async def add_screenshot_if_available(
         return _format_result(result, True, screenshot_result.payload)
 
     return _json(result.to_dict())
+
+
+# ---------------------------------------------------------------------------
+# File attachment helper (embed generated files in the chat as base64 blobs)
+# ---------------------------------------------------------------------------
+
+
+def attach_files_result(
+    result: dict,
+    files: list[tuple[str, str]],
+    max_bytes: int,
+) -> list[TextContent | EmbeddedResource] | str:
+    """Embed small generated files in the MCP response as downloadable blobs.
+
+    Reads each file from disk, base64-encodes it and wraps it in an
+    ``EmbeddedResource`` so the engineer can download it straight from the chat
+    (useful when the MCP server runs on a remote host and the ``out`` folder is
+    not reachable).
+
+    Args:
+        result: JSON-serializable dict returned by the specgen build. It is
+            mutated in place to append an ``attachments_skipped`` list for any
+            file that is missing or exceeds ``max_bytes``.
+        files: list of ``(absolute_path, mime_type)`` pairs to attach.
+        max_bytes: per-file size ceiling; files above it are NOT embedded and
+            are reported in ``attachments_skipped`` (still reachable by path).
+
+    Returns:
+        A list ``[TextContent(json), *EmbeddedResource]`` when at least one file
+        was embedded, or the plain ``_json(result)`` string when nothing could
+        be attached (all files missing/too large or the list is empty).
+    """
+    embedded: list[EmbeddedResource] = []
+    skipped: list[dict] = []
+
+    for path, mime in files:
+        if not path or not os.path.isfile(path):
+            skipped.append({
+                "name": os.path.basename(path) if path else path,
+                "path": path,
+                "reason": "no existe en disco",
+            })
+            continue
+        size = os.path.getsize(path)
+        if size > max_bytes:
+            skipped.append({
+                "name": os.path.basename(path),
+                "path": path,
+                "size_bytes": size,
+                "reason": f"supera el umbral de adjunto ({max_bytes} bytes)",
+            })
+            continue
+        with open(path, "rb") as fh:
+            blob = base64.b64encode(fh.read()).decode("ascii")
+        uri = pathlib.Path(os.path.abspath(path)).as_uri()
+        embedded.append(
+            EmbeddedResource(
+                type="resource",
+                resource=BlobResourceContents(
+                    uri=uri,
+                    mimeType=mime,
+                    blob=blob,
+                ),
+            )
+        )
+
+    if skipped:
+        result["attachments_skipped"] = skipped
+
+    if not embedded:
+        return _json(result)
+
+    return [TextContent(type="text", text=_json(result)), *embedded]
