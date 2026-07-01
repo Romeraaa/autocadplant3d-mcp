@@ -68,3 +68,6 @@ PIDv4-CTO/
 
 # pytest
 .pytest_cache/
+
+# Salidas generadas por la PoC specgen (binarios grandes, no versionar)
+poc/spec_generation/out/
