@@ -1,6 +1,7 @@
-"""AutoCAD MCP Server v3.1 — 8 consolidated tools with operation dispatch.
+"""AutoCAD MCP Server v3.1 — consolidated tools with operation dispatch.
 
-Tools: drawing, entity, layer, block, annotation, pid, view, system
+Tools: drawing, entity, layer, block, annotation, pid, view, system, plant3d,
+specgen, pnid.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from autocad_mcp.client import (
     _json,
     _safe,
     add_screenshot_if_available,
-    attach_files_result,
+    attach_files_with_cleanup,
     get_backend,
 )
 
@@ -1106,7 +1107,6 @@ async def specgen(
 
     if operation == "build":
         attach_files = bool(data.get("attach_files", True))
-        temp_out_note = None
         temp_dir = None
         if not out:
             if not attach_files:
@@ -1117,10 +1117,6 @@ async def specgen(
                 })
             temp_dir = tempfile.mkdtemp(prefix="specgen_")
             out = temp_dir
-            temp_out_note = (
-                f"'out' no indicado: los ficheros se generaron en un directorio temporal "
-                f"del servidor ({out}) y se adjuntan al chat."
-            )
         result = specgen_api.build(
             piping_class=piping_class,
             catalogs_dir=catalogs,
@@ -1136,8 +1132,6 @@ async def specgen(
                 shutil.rmtree(temp_dir, ignore_errors=True)
             return _json(result)
 
-        if temp_out_note:
-            result["note"] = temp_out_note
         max_bytes = int(os.environ.get("SPECGEN_MAX_ATTACH_BYTES", 15 * 1024 * 1024))
         files = result.get("files") or {}
         xlsx_mime = (
@@ -1149,7 +1143,8 @@ async def specgen(
             (files.get("pspx"), "application/octet-stream"),
             (files.get("review_xlsx"), xlsx_mime),
         ]
-        return attach_files_result(result, to_attach, max_bytes)
+        # Auto-created temp dir must not survive the call: attach (reads files) then delete.
+        return attach_files_with_cleanup(result, to_attach, max_bytes, temp_dir)
 
     if operation == "extend_catalog":
         if not out:
@@ -1162,6 +1157,112 @@ async def specgen(
         return _json(result)
 
     return _json({"error": f"Unknown specgen operation: {operation}"})
+
+
+# ==========================================================================
+# 11. pnid — line-list extraction from existing P&IDs in PDF (read-only)
+# ==========================================================================
+
+
+@mcp.tool(annotations={"title": "P&ID PDF Extraction", "readOnlyHint": True})
+@_safe("pnid")
+async def pnid(
+    operation: str,
+    data: dict | None = None,
+) -> ToolResult:
+    """Extrae la line-list (lista de líneas de tubería) de P&IDs existentes en PDF.
+
+    SOLO LECTURA: lee la capa de texto vectorial del PDF con PyMuPDF (sin OCR), reconoce
+    los tokens de línea (dos familias de naming: legacy y codificada), deduplica por hoja y
+    calcula la cobertura frente a los candidatos alfanuméricos. No abre AutoCAD ni modifica
+    nada.
+
+    ⚠️ NO confundir con la tool ``pid``: ``pid`` DIBUJA/inserta símbolos P&ID en AutoCAD;
+    ``pnid`` EXTRAE datos de P&IDs ya existentes en PDF y es de solo lectura.
+
+    Operations:
+      line_list — Extrae la line-list de uno o varios PDFs.
+                data: {pdf?|pdfs?|dir?, out?, format?(csv|xlsx|both), attach_files?(def True),
+                       bonus?}
+                  - pdf: ruta a un PDF (atajo de un solo fichero).
+                  - pdfs: lista de rutas a PDFs.
+                  - dir: carpeta con *.pdf (se combina con pdf/pdfs).
+                  - format: formato de los ficheros generados (por defecto "xlsx").
+                  - bonus: si True, añade instrumentos y equipos (hojas aparte, best-effort).
+                Debe llegar al menos un PDF (pdf/pdfs) o un dir existente.
+                ADJUNTOS EN EL CHAT: por defecto (attach_files=True) los ficheros generados
+                (LINE_LIST.csv/.xlsx + COBERTURA.txt) se DEVUELVEN INCRUSTADOS en la respuesta
+                como recursos descargables (base64), además de escribirse a disco. 'out' es
+                OPCIONAL cuando attach_files=True: si se omite, se genera en un directorio
+                temporal del servidor y se adjunta (la respuesta lo indica en 'note'). Con
+                attach_files=False se devuelve solo el JSON con las rutas (comportamiento
+                clásico, requiere 'out' para tener ficheros). Ficheros que superen
+                PNID_MAX_ATTACH_BYTES (def. 15 MB) o que no existan se listan en
+                'attachments_skipped' y quedan accesibles por ruta.
+                Devuelve {ok, sheets, lines, coverage, unrecognized, [instruments], [equipment],
+                [files], [attachments_skipped], [note]}.
+    """
+    data = data or {}
+    from autocad_mcp.pnid import api as pnid_api
+
+    if operation != "line_list":
+        return _json({"error": f"Unknown pnid operation: {operation}"})
+
+    # --- Reunir y validar la entrada (español, devuelto como JSON, nunca lanzado) ---
+    pdfs: list[str] = []
+    if data.get("pdf"):
+        pdfs.append(data["pdf"])
+    if data.get("pdfs"):
+        pdfs.extend(data["pdfs"])
+    directory = data.get("dir")
+
+    if not pdfs and not directory:
+        return _json({
+            "error": "Falta la entrada: indica 'pdf' (un PDF), 'pdfs' (lista) o 'dir' (carpeta).",
+        })
+    if directory and not os.path.isdir(directory):
+        return _json({"error": f"No existe la carpeta indicada en 'dir': {directory}"})
+
+    fmt = data.get("format", "xlsx")
+    bonus = bool(data.get("bonus"))
+    attach_files = bool(data.get("attach_files", True))
+    out = data.get("out")
+
+    temp_dir = None
+    if not out and attach_files:
+        temp_dir = tempfile.mkdtemp(prefix="pnid_")
+        out = temp_dir
+
+    result = pnid_api.extract_line_list(
+        pdfs=pdfs or None,
+        dir=directory,
+        out_dir=out,
+        fmt=fmt,
+        bonus=bonus,
+    )
+
+    # attach_files=False, o extracción fallida -> JSON plano (sin adjuntar).
+    if not attach_files or not result.get("ok"):
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        return _json(result)
+
+    max_bytes = int(os.environ.get("PNID_MAX_ATTACH_BYTES", 15 * 1024 * 1024))
+    csv_mime = "text/csv"
+    xlsx_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    txt_mime = "text/plain"
+
+    def _mime_for(path: str) -> str:
+        low = path.lower()
+        if low.endswith(".csv"):
+            return csv_mime
+        if low.endswith(".xlsx"):
+            return xlsx_mime
+        return txt_mime
+
+    to_attach = [(f, _mime_for(f)) for f in (result.get("files") or [])]
+    # Auto-created temp dir must not survive the call: attach (reads files) then delete.
+    return attach_files_with_cleanup(result, to_attach, max_bytes, temp_dir)
 
 
 # ==========================================================================

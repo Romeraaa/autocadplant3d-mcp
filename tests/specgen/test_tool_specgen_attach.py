@@ -181,9 +181,24 @@ async def test_build_without_out_uses_temp_dir(fake_build, tmp_path):
     assert isinstance(out, list)
     text = json.loads(out[0].text)
     assert "note" in text
-    assert "temporal" in text["note"]
+    assert "no persistidos en disco" in text["note"]
     # build was called with a temp dir (mkdtemp prefix)
     assert "specgen_" in fake_build["out_dir"]
+
+
+async def test_build_temp_dir_removed_after_attach(fake_build, tmp_path):
+    """Sin 'out' + attach_files=True (ok=True): el temp dir auto-creado NO debe sobrevivir."""
+    import os
+
+    pc, cat = _valid_paths(tmp_path)
+    out = await _call_build({"piping_class": pc, "catalogs": cat})
+    assert isinstance(out, list)  # se adjuntó correctamente
+    temp_dir = fake_build["out_dir"]
+    assert "specgen_" in temp_dir
+    # El contenido viaja inline (base64); el temp dir auto-creado ya no existe en disco.
+    assert not os.path.exists(temp_dir)
+    embedded = [c for c in out if isinstance(c, EmbeddedResource)]
+    assert len(embedded) == 3  # los ficheros se incrustaron antes de borrar
 
 
 async def test_build_without_out_no_attach_errors(fake_build, tmp_path):

@@ -8,6 +8,7 @@ import functools
 import json
 import os
 import pathlib
+import shutil
 from typing import Any
 
 import structlog
@@ -241,3 +242,35 @@ def attach_files_result(
         return _json(result)
 
     return [TextContent(type="text", text=_json(result)), *embedded]
+
+
+def attach_files_with_cleanup(
+    result: dict,
+    files: list[tuple[str, str]],
+    max_bytes: int,
+    temp_dir: str | None,
+) -> list[TextContent | EmbeddedResource] | str:
+    """Attach files inline and, if ``out`` was an auto-created temp dir, delete it.
+
+    Shared by the ``specgen.build`` and ``pnid.line_list`` tools so their
+    temp-dir handling never diverges. Because :func:`attach_files_result` reads
+    every file and embeds it as base64 (the content travels inline; the engineer
+    never touches the server disk), an auto-created temp dir must NOT survive the
+    call. The attachment list is built FIRST (that reads the files), then the
+    temp dir is removed.
+
+    Args:
+        result: JSON-serializable build result (mutated in place, see
+            :func:`attach_files_result`). When ``temp_dir`` is set, its ``note``
+            is overwritten to make clear nothing persisted on disk.
+        files: ``(absolute_path, mime_type)`` pairs to embed.
+        max_bytes: per-file size ceiling.
+        temp_dir: the auto-created temp dir to delete after attaching, or None
+            when the caller passed an explicit ``out`` (nothing is deleted).
+    """
+    if temp_dir:
+        result["note"] = "Ficheros devueltos solo en el chat (no persistidos en disco)."
+    attached = attach_files_result(result, files, max_bytes)
+    if temp_dir:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    return attached

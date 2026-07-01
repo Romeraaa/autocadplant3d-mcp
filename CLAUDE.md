@@ -115,7 +115,7 @@ layer(operation="create", data={"name": "MUROS", "color": "1"})
 
 ---
 
-## Los 10 Tools MCP
+## Las 11 Tools MCP
 
 ### `drawing` — Gestión del dibujo
 `create` · `open` · `info` · `save` · `save_as_dxf` · `plot_pdf` · `purge` · `get_variables` · `undo` · `redo`
@@ -161,6 +161,13 @@ Genera ficheros de especificación Plant 3D (`.pspc`/`.pspx`) a partir de una pi
 
 Paquete en `src/autocad_mcp/specgen/`; capa `api.py` compartida con la CLI (`python -m autocad_mcp.specgen`). Depende de un catálogo `.pcat` con las piezas; no requiere API .NET ni AutoCAD abierto.
 
+### `pnid` — Extracción de line-list desde P&IDs en PDF
+Operación única `line_list`: extrae los tags de línea de P&IDs en PDF (texto vectorial, sin OCR) y produce una line-list estructurada (CSV/XLSX) + bucket de "no reconocidos" + métrica de cobertura. Reconoce dos familias de numeración legacy Repsol: `<diám>-<servicio>[-<nombre>]` (p.ej. `6"-HIDROGENO`) y `[<área>-]<diám>[-]<fluido>-<número>[-<clase>]` (p.ej. `C29-6"P-1027`). Por defecto adjunta los ficheros generados al chat (igual que `specgen build`); `attach_files=False` para modo solo-ruta.
+
+⚠️ **No confundir con `pid`:** `pid` **dibuja** símbolos P&ID en AutoCAD; `pnid` **extrae** datos de P&IDs PDF existentes (solo lectura).
+
+Paquete en `src/autocad_mcp/pnid/`; CLI propia (`python -m autocad_mcp.pnid`). Depende de `pymupdf` (dependencia base del proyecto).
+
 ---
 
 ## Archivos clave
@@ -174,6 +181,7 @@ Paquete en `src/autocad_mcp/specgen/`; capa `api.py` compartida con la CLI (`pyt
 | `lisp-code/mcp_dispatch.lsp` | Dispatcher LISP (debe cargarse en AutoCAD) |
 | `lisp-code/attribute_tools.lsp` | Herramientas de atributos (debe cargarse) |
 | `src/autocad_mcp/specgen/` | Paquete specgen: generación de specs/catálogos Plant 3D desde piping class Excel |
+| `src/autocad_mcp/pnid/` | Paquete de extracción de line-list desde P&IDs en PDF (tool `pnid`) |
 | `plant3d-plugin/` | Plugin C# `PlantMcpDispatch` (locate/plugin_status); ver `docs/plant3d-tools.md` |
 | `docs/plant3d-tools.md` | Referencia detallada del tool `plant3d` y del plugin .NET |
 | `.mcp.json` | Config del servidor MCP para Claude Code |
@@ -214,5 +222,6 @@ $env:AUTOCAD_MCP_IPC_TIMEOUT = "15"
   en AutoCAD vivo** — firmas de API descubiertas con el `probe`, bloqueado por DWG de prueba
   multi-modelo (pendiente de la organización).
 - **Escritura en Plant 3D** (p.ej. `assign-layers-by-property`): requiere plugin .NET → **PENDIENTE / no abordada aún**.
+- **PoC G1 (line-list desde PDF de P&ID): HECHO** (2026-07-01) — promovido a tool MCP `pnid`. Siguiente PoC de Fase 2 pendiente: **I1** (validar spec exportada vs. spec oficial).
 - **Herramientas estructurales** (`HERRAMIENTAS_PROPUESTAS.md`): 10 propuestas; prioridad actual
   ⭐⭐⭐ Plantillas de capas · Cajetín · Cuadro de superficies.
