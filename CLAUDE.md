@@ -115,7 +115,7 @@ layer(operation="create", data={"name": "MUROS", "color": "1"})
 
 ---
 
-## Los 9 Tools MCP
+## Los 10 Tools MCP
 
 ### `drawing` — Gestión del dibujo
 `create` · `open` · `info` · `save` · `save_as_dxf` · `plot_pdf` · `purge` · `get_variables` · `undo` · `redo`
@@ -153,18 +153,27 @@ Modificar: `copy` · `move` · `rotate` · `scale` · `mirror` · `offset` · `a
 
 📖 **Detalle por operación (parámetros, salida, esquema) y arquitectura del plugin .NET → `docs/plant3d-tools.md`.** Léelo cuando necesites el comportamiento exacto de una operación.
 
+### `specgen` — Generación de specs/catálogos Plant 3D
+Genera ficheros de especificación Plant 3D (`.pspc`/`.pspx`) a partir de una piping class en Excel.
+- `analyze` — solo lectura: cobertura por nivel de confianza + huecos sin cubrir.
+- `build` — genera `.pspc`/`.pspx`, informe `REVISION_MATCHING.xlsx` y, opcionalmente, catálogos H2 ampliados (`--extend-h2`).
+- `extend_catalog` — amplía un catálogo `.pcat` con variantes `-H2` clonando familias base.
+
+Paquete en `src/autocad_mcp/specgen/`; capa `api.py` compartida con la CLI (`python -m autocad_mcp.specgen`). Depende de un catálogo `.pcat` con las piezas; no requiere API .NET ni AutoCAD abierto.
+
 ---
 
 ## Archivos clave
 
 | Archivo | Rol |
 |---------|-----|
-| `src/autocad_mcp/server.py` | 9 tools MCP con dispatch de operaciones |
+| `src/autocad_mcp/server.py` | 10 tools MCP con dispatch de operaciones |
 | `src/autocad_mcp/backends/file_ipc.py` | Backend IPC con AutoCAD (canal LISP + canal plugin .NET) |
 | `src/autocad_mcp/plant3d_query.py` | Consultas de solo lectura sobre los `.dcf` (SQLite) de Plant 3D |
 | `src/autocad_mcp/config.py` | Variables de entorno y detección de backend |
 | `lisp-code/mcp_dispatch.lsp` | Dispatcher LISP (debe cargarse en AutoCAD) |
 | `lisp-code/attribute_tools.lsp` | Herramientas de atributos (debe cargarse) |
+| `src/autocad_mcp/specgen/` | Paquete specgen: generación de specs/catálogos Plant 3D desde piping class Excel |
 | `plant3d-plugin/` | Plugin C# `PlantMcpDispatch` (locate/plugin_status); ver `docs/plant3d-tools.md` |
 | `docs/plant3d-tools.md` | Referencia detallada del tool `plant3d` y del plugin .NET |
 | `.mcp.json` | Config del servidor MCP para Claude Code |
